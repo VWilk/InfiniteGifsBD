@@ -1,0 +1,27 @@
+{
+    "config": [
+        {
+            "type": "category",
+            "id": "basic",
+            "name": "Setup",
+            "collapsible": true,
+            "shown": false,
+            "settings": [
+                {
+                    "type": "text",
+                    "id": "userGithubToken",
+                    "name": "Github API Token",
+                    "note": "Github API token here!",
+                    "value": "Github token here"
+                },
+                {
+                    "type": "switch",
+                    "id": "switch",
+                    "name": "Basic Switch",
+                    "note": "Basic switch with no fluff",
+                    "value": false
+                }
+            ]
+        }
+    ]
+}
