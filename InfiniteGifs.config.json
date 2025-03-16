@@ -37,14 +37,14 @@
                     "id": "userGithubToken",
                     "name": "GitHub API Token",
                     "note": "GitHub API token here!",
-                    "value": "asa"
+                    "value": "bassa"
                 },
                 {
                     "type": "switch",
                     "id": "basicSwitch",
                     "name": "Basic Switch",
                     "note": "Basic switch with no fluff",
-                    "value": true
+                    "value": false
                 }
             ]
         }
