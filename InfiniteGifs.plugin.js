@@ -43,7 +43,7 @@ let config = {
                     id: "userGithubToken",
                     name: "GitHub API Token",
                     note: "GitHub API token here!",
-                    value: "GitHub token here",
+                    value: "",
                 },
                 {
                     type: "switch",
@@ -66,6 +66,7 @@ let config = {
     },
 
     findSetting(id) {
+        console.log(id)
         return this.settings[0].settings.find(s => s.id === id);
     }
 };
@@ -79,6 +80,7 @@ class InfiniteGifs {
     }
 
     start() {
+        console.log(this.githubToken)
     }
 
     stop() {
@@ -89,19 +91,18 @@ class InfiniteGifs {
     getSettingsPanel() {
         return BdApi.UI.buildSettingsPanel({
             settings: config.settings,
-            onChange: (id, value) => {
-                console.log("Changed setting", id, value);
+            onChange: (settingGroup, settingId, value) => {
+                console.log("Changed setting", settingGroup, settingId, value);
                 console.log("-----------------------------------------")
-                console.log(id)
-                console.log(value)
-                this.updateUserSettings(id, value);
+                this.updateUserSettings(settingGroup, settingId, value);
             },
         });
     }
 
-    updateUserSettings(id, value) {
-        const setting = config.findSetting(id);
-        console.log(setting);
+    updateUserSettings(settingGroup, settingId, value) {
+        console.log("Still going... WITH ID:", settingGroup, "OF VALUE:", value)
+        const setting = config.findSetting(settingId);
+        console.log("Still going, POST SETTINGS", setting);
         if (setting) setting.value = value;
         console.log("Updated setting", setting.value );
         config.saveSettings();
