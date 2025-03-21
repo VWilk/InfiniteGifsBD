@@ -37,7 +37,7 @@
                     "id": "userGithubToken",
                     "name": "GitHub API Token",
                     "note": "GitHub API token here!",
-                    "value": "bassa"
+                    "value": "sasaadaw"
                 },
                 {
                     "type": "switch",

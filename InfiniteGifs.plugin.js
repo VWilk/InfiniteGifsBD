@@ -80,7 +80,6 @@ class InfiniteGifs {
     }
 
     start() {
-        console.log(this.githubToken)
     }
 
     stop() {
@@ -92,19 +91,14 @@ class InfiniteGifs {
         return BdApi.UI.buildSettingsPanel({
             settings: config.settings,
             onChange: (settingGroup, settingId, value) => {
-                console.log("Changed setting", settingGroup, settingId, value);
-                console.log("-----------------------------------------")
                 this.updateUserSettings(settingGroup, settingId, value);
             },
         });
     }
 
     updateUserSettings(settingGroup, settingId, value) {
-        console.log("Still going... WITH ID:", settingGroup, "OF VALUE:", value)
         const setting = config.findSetting(settingId);
-        console.log("Still going, POST SETTINGS", setting);
         if (setting) setting.value = value;
-        console.log("Updated setting", setting.value );
         config.saveSettings();
     }
 
