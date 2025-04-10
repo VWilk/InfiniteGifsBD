@@ -36,22 +36,37 @@ let config = {
             id: "basic",
             name: "Setup",
             collapsible: true,
-            shown: false,
+            shown: true,
             settings: [
                 {
-                    type: "text",
-                    id: "userGithubToken",
-                    name: "GitHub API Token",
-                    note: "GitHub API token here!",
-                    value: "",
-                },
-                {
-                    type: "switch",
-                    id: "basicSwitch",
-                    name: "Basic Switch",
-                    note: "Basic switch with no fluff",
-                    value: false,
-                },
+                type: "category",
+                id: "basic",
+                name: "Setup",
+                collapsible: true,
+                shown: true,
+                settings: [
+                    {
+                        type: "text",
+                        id: "userGithubToken",
+                        name: "GitHub API Token",
+                        note: "GitHub API token here!",
+                        value: "",
+                    },
+                    {
+                        type: "text",
+                        id: "userGithubRepositoryName",
+                        name: "Github Repository Name eg: username/githubRepository",
+                        note: "Github Repository Name eg: username/githubRepository",
+                        value: "",
+                    },
+                    {
+                        type: "switch",
+                        id: "GithubOnOff",
+                        name: "GithubSwitch",
+                        note: "Turn on or off functionality of Github.",
+                        value: false,
+                    },
+                ]
             ],
         },
     ],
@@ -70,6 +85,12 @@ let config = {
         return this.settings[0].settings.find(s => s.id === id);
     }
 };
+
+class GithubAdapter {
+    
+}
+
+
 
 class InfiniteGifs {
     constructor(meta) {
