@@ -7,12 +7,6 @@
  * @source https://github.com/VWilk/InfiniteGifsBD
  */
 
-/* 
- * TODO: Fetch discord favourite Gifs
- * Store/Cache Locally? Then load locally.
- * Add github sync. 
- */
-
 const config = {
     info: {
         name: "InfiniteGifs",
@@ -35,16 +29,6 @@ const config = {
             title: "Version 1.0.1",
             type: "fixed",
             items: ["Fixed clipboard permission issues by adding a direct text input option"]
-        },
-        {
-            title: "On-going",
-            type: "progress",
-            items: [
-                "Automatically sync with GitHub?",
-                "Sync between mobile client.",
-                "Different gif profiles.",
-                "Gif search?"
-            ]
         }
     ],
     defaultConfig: [
@@ -105,14 +89,6 @@ class InfiniteGifs {
         this.uniqueUrls = [];
     }
 
-    // Normalize URLs by fixing double HTTPS prefixes and removing query parameters
-    normalizeUrl(url) {
-        if (url.includes('/https://')) {
-            url = 'https://' + url.split('/https://').pop();
-        }
-        return url.split('?')[0].split('#')[0];
-    }
-
     loadSettings() {
         const saved = BdApi.Data.load("InfiniteGifs", "settings");
         return saved || JSON.parse(JSON.stringify(config.defaultConfig));
@@ -140,7 +116,6 @@ class InfiniteGifs {
         console.log(`${config.info.name} plugin stopped`);
     }
 
-    // Load URLs from BetterDiscord storage
     loadUrls() {
         try {
             const urls = BdApi.Data.load("InfiniteGifs", "media_urls");
@@ -157,7 +132,6 @@ class InfiniteGifs {
         return [];
     }
     
-    // Get a random GIF from the collection
     getRandomGif() {
         if (this.uniqueUrls.length === 0) {
             this.loadUrls();
@@ -171,50 +145,39 @@ class InfiniteGifs {
         return this.uniqueUrls[randomIndex];
     }
 
-    // Create the settings panel - FIXED VERSION that works with current BetterDiscord API
     getSettingsPanel() {
         const panel = document.createElement("div");
         panel.className = "bd-settings-panel";
         panel.style.padding = "20px";
         
-        // Add settings from config
         this.generateSettingsFromConfig(panel);
-        
-        // Add stats section and preview
         this.addStatsSection(panel);
         
         return panel;
     }
     
-    // Generate settings UI from config
     generateSettingsFromConfig(panel) {
-        // For each category in settings
         this.settings.forEach(category => {
-            // Create category container
             const categoryContainer = document.createElement("div");
             categoryContainer.className = "settings-category";
             categoryContainer.style.marginBottom = "20px";
             
-            // Add category title
             const categoryTitle = document.createElement("h2");
             categoryTitle.textContent = category.name;
             categoryTitle.style.marginBottom = "10px";
             categoryContainer.appendChild(categoryTitle);
             
-            // Add settings in this category
             category.settings.forEach(setting => {
                 const settingContainer = document.createElement("div");
                 settingContainer.className = "settings-item";
                 settingContainer.style.marginBottom = "15px";
                 
-                // Add setting name
                 const settingName = document.createElement("h3");
                 settingName.textContent = setting.name;
                 settingName.style.fontSize = "16px";
                 settingName.style.marginBottom = "5px";
                 settingContainer.appendChild(settingName);
                 
-                // Add note if it exists
                 if (setting.note) {
                     const settingNote = document.createElement("div");
                     settingNote.textContent = setting.note;
@@ -224,32 +187,26 @@ class InfiniteGifs {
                     settingContainer.appendChild(settingNote);
                 }
                 
-                // Create and add input element based on setting type
                 let inputElement;
                 
                 switch (setting.type) {
                     case "text":
-                        // Special handling for base64proto2 field to prevent UI crashes with large strings
                         if (setting.id === "base64proto2") {
-                            // Create a container for the text area and controls
                             const textAreaContainer = document.createElement("div");
                             textAreaContainer.style.width = "100%";
                             textAreaContainer.style.marginBottom = "10px";
                             
-                            // Create hidden textarea for actual base64 data storage
                             const hiddenTextarea = document.createElement("textarea");
                             hiddenTextarea.style.display = "none";
                             hiddenTextarea.value = setting.value || "";
                             textAreaContainer.appendChild(hiddenTextarea);
                             
-                            // Create file input for loading from file
                             const fileInput = document.createElement("input");
                             fileInput.type = "file";
                             fileInput.accept = ".txt";
                             fileInput.style.marginBottom = "10px";
                             textAreaContainer.appendChild(fileInput);
                             
-                            // Create upload instruction
                             const instruction = document.createElement("div");
                             instruction.textContent = "Upload a file containing your base64 data";
                             instruction.style.fontSize = "12px";
@@ -257,7 +214,6 @@ class InfiniteGifs {
                             instruction.style.color = "#999";
                             textAreaContainer.appendChild(instruction);
                             
-                            // Add "or" text
                             const orText = document.createElement("div");
                             orText.textContent = "-- OR --";
                             orText.style.fontSize = "12px";
@@ -266,7 +222,6 @@ class InfiniteGifs {
                             orText.style.fontWeight = "bold";
                             textAreaContainer.appendChild(orText);
                             
-                            // Add direct text input with explanatory text
                             const directInputLabel = document.createElement("div");
                             directInputLabel.textContent = "Paste base64 data directly below:";
                             directInputLabel.style.fontSize = "12px";
@@ -274,7 +229,6 @@ class InfiniteGifs {
                             directInputLabel.style.color = "#999";
                             textAreaContainer.appendChild(directInputLabel);
                             
-                            // Create direct input textarea
                             const directInput = document.createElement("textarea");
                             directInput.style.width = "100%";
                             directInput.style.height = "100px";
@@ -284,7 +238,6 @@ class InfiniteGifs {
                             directInput.placeholder = "Paste your base64 data here...";
                             textAreaContainer.appendChild(directInput);
                             
-                            // Create apply button for direct input
                             const applyButton = document.createElement("button");
                             applyButton.textContent = "Apply Base64 Data";
                             applyButton.style.margin = "0 0 10px 0";
@@ -298,28 +251,19 @@ class InfiniteGifs {
                             applyButton.addEventListener("click", () => {
                                 const text = directInput.value.trim();
                                 if (text && text.length > 0) {
-                                    // Update the hidden textarea and settings
                                     hiddenTextarea.value = text;
                                     setting.value = text;
                                     this.saveSettings();
                                     
-                                    // Update status indicator
+                                    const statusDiv = textAreaContainer.querySelector("div:last-child");
                                     statusDiv.textContent = "✓ Base64 data loaded (" + Math.round(text.length / 1024) + " KB)";
                                     statusDiv.style.color = "#43b581";
-                                    
-                                    // Clear the input field
                                     directInput.value = "";
-                                    
-                                    // Process the new data
                                     this.decodeGifs();
-                                } else {
-                                    statusDiv.textContent = "❌ No base64 data provided";
-                                    statusDiv.style.color = "#f04747";
                                 }
                             });
                             textAreaContainer.appendChild(applyButton);
                             
-                            // Create status indicator
                             const statusDiv = document.createElement("div");
                             statusDiv.style.marginTop = "5px";
                             statusDiv.style.fontSize = "13px";
@@ -333,7 +277,6 @@ class InfiniteGifs {
                             }
                             textAreaContainer.appendChild(statusDiv);
                             
-                            // Process file upload
                             fileInput.addEventListener("change", (e) => {
                                 if (e.target.files && e.target.files[0]) {
                                     const file = e.target.files[0];
@@ -341,18 +284,12 @@ class InfiniteGifs {
                                     
                                     reader.onload = (event) => {
                                         const fileContent = event.target.result;
-                                        
-                                        // Update the hidden textarea and settings
                                         hiddenTextarea.value = fileContent;
                                         setting.value = fileContent;
                                         this.saveSettings();
-                                        
-                                        // Update status indicator
                                         statusDiv.textContent = "✓ Base64 data loaded from " + file.name + 
                                                               " (" + Math.round(fileContent.length / 1024) + " KB)";
                                         statusDiv.style.color = "#43b581";
-                                        
-                                        // Process the new data
                                         this.decodeGifs();
                                     };
                                     
@@ -361,12 +298,10 @@ class InfiniteGifs {
                                         statusDiv.style.color = "#f04747";
                                     };
                                     
-                                    // Read the file as text
                                     reader.readAsText(file);
                                 }
                             });
                             
-                            // Clear button 
                             const clearButton = document.createElement("button");
                             clearButton.textContent = "Clear Data";
                             clearButton.style.margin = "0 0 0 10px";
@@ -383,17 +318,13 @@ class InfiniteGifs {
                                 this.saveSettings();
                                 statusDiv.textContent = "Data cleared";
                                 statusDiv.style.color = "#f04747";
-                                
-                                // Reset file input
                                 fileInput.value = "";
-                                // Clear direct input
                                 directInput.value = "";
                             });
                             textAreaContainer.appendChild(clearButton);
                             
                             inputElement = textAreaContainer;
                         } else {
-                            // Regular text input for other fields
                             inputElement = document.createElement("input");
                             inputElement.type = "text";
                             inputElement.value = setting.value;
@@ -469,12 +400,10 @@ class InfiniteGifs {
                 categoryContainer.appendChild(settingContainer);
             });
             
-            // Add the category to the panel
             panel.appendChild(categoryContainer);
         });
     }
     
-    // Add stats section with preview button
     addStatsSection(panel) {
         const statsContainer = document.createElement("div");
         statsContainer.style.marginTop = "20px";
@@ -488,7 +417,7 @@ class InfiniteGifs {
         statsContainer.appendChild(statsTitle);
         
         const statsInfo = document.createElement("div");
-        statsInfo.textContent = `${this.uniqueUrls.length} unique GIFs/videos are available`;
+        statsInfo.textContent = `${this.uniqueUrls.length} GIFs/videos are available`;
         statsInfo.style.marginBottom = "10px";
         statsContainer.appendChild(statsInfo);
         
@@ -504,14 +433,12 @@ class InfiniteGifs {
         previewButton.onclick = () => {
             const gifUrl = this.getRandomGif();
             if (gifUrl) {
-                // Create preview container
                 const preview = document.createElement("div");
                 preview.className = "gif-preview";
                 preview.style.marginTop = "15px";
                 preview.style.maxWidth = "100%";
                 preview.style.overflow = "hidden";
                 
-                // Add URL text
                 const urlText = document.createElement("div");
                 urlText.textContent = gifUrl;
                 urlText.style.wordBreak = "break-all";
@@ -522,7 +449,6 @@ class InfiniteGifs {
                 urlText.style.borderRadius = "3px";
                 preview.appendChild(urlText);
                 
-                // Add copy button
                 const copyButton = document.createElement("button");
                 copyButton.textContent = "Copy URL";
                 copyButton.style.fontSize = "12px";
@@ -553,7 +479,6 @@ class InfiniteGifs {
                 };
                 preview.appendChild(copyButton);
                 
-                // Add media preview based on file type
                 if (gifUrl.endsWith(".mp4")) {
                     const video = document.createElement("video");
                     video.src = gifUrl;
@@ -574,15 +499,10 @@ class InfiniteGifs {
                     preview.appendChild(img);
                 }
                 
-                // Remove existing preview if it exists
                 const existingPreview = statsContainer.querySelector(".gif-preview");
-                if (existingPreview) {
-                    statsContainer.removeChild(existingPreview);
-                }
-                
+                if (existingPreview) statsContainer.removeChild(existingPreview);
                 statsContainer.appendChild(preview);
             } else {
-                // Show "no GIFs available" message
                 const noGifsMessage = document.createElement("div");
                 noGifsMessage.textContent = "No GIFs available. Please decode some GIF links first.";
                 noGifsMessage.className = "gif-preview";
@@ -592,12 +512,8 @@ class InfiniteGifs {
                 noGifsMessage.style.backgroundColor = "#f8d7da";
                 noGifsMessage.style.borderRadius = "3px";
                 
-                // Remove existing preview if it exists
                 const existingPreview = statsContainer.querySelector(".gif-preview");
-                if (existingPreview) {
-                    statsContainer.removeChild(existingPreview);
-                }
-                
+                if (existingPreview) statsContainer.removeChild(existingPreview);
                 statsContainer.appendChild(noGifsMessage);
             }
         };
@@ -606,7 +522,6 @@ class InfiniteGifs {
         panel.appendChild(statsContainer);
     }
     
-    // Decode base64 data from settings
     decodeGifs() {
         const base64Setting = this.findSetting("base64proto2");
         if (!base64Setting) {
@@ -622,11 +537,8 @@ class InfiniteGifs {
                 return null;
             }
             
-            // Decode base64 string
             const decodedData = atob(encodedData);
             console.log("Base64 decoded successfully");
-            
-            // Process the decoded data to extract URLs
             this.processDecodedData(decodedData);
             return decodedData;
         } catch (error) {
@@ -635,36 +547,22 @@ class InfiniteGifs {
         }
     }
     
-    // Process the decoded data to extract URLs
     processDecodedData(decodedData) {
-        // Get binary representation of the data
         const binaryData = new TextEncoder().encode(decodedData);
-        
-        // Extract URLs
         this.extractUrlsFromBinaryData(binaryData);
-        
-        // Load existing URLs
         this.loadExistingUrls();
-        
-        // Process and save URLs
         this.processAndSaveUrls();
     }
     
-    // Extract URLs from binary data
     extractUrlsFromBinaryData(binaryData) {
-        // JavaScript-optimized approach - convert to string first then use regex
         const decoder = new TextDecoder('latin1');
         const decodedString = decoder.decode(binaryData);
-        
-        // Use a single regex with word boundaries to improve matching
         const urlRegex = /https?:\/\/[^\s\x00-\x1F<>]*\.(?:gif|mp4)[^\s\x00-\x1F<>]*/g;
         const matches = decodedString.match(urlRegex) || [];
-        
         this.urls = matches;
         console.log(`Found ${this.urls.length} URLs in decoded data`);
     }
     
-    // Load existing URLs from storage
     loadExistingUrls() {
         try {
             const existingUrls = BdApi.Data.load("InfiniteGifs", "media_urls");
@@ -677,91 +575,15 @@ class InfiniteGifs {
         }
     }
     
-    // Process URLs (deduplicate, filter) and save them
     processAndSaveUrls() {
-        // Deduplicate URLs
-        this.deduplicateUrls();
-        
-        // Filter media URLs with corresponding CDN URLs
-        this.filterMediaUrls();
-        
-        // Save unique URLs to BetterDiscord storage
+        this.uniqueUrls = this.urls;
         this.saveUrlsToFile();
-        
-        console.log(`Cleaned and deduplicated ${this.urls.length} URLs to ${this.uniqueUrls.length} unique URLs.`);
+        console.log(`Saved ${this.uniqueUrls.length} URLs without processing`);
     }
     
-    // Deduplicate URLs
-    deduplicateUrls() {
-        const seen = new Set();
-        this.uniqueUrls = [];
-        
-        for (const url of this.urls) {
-            const cleanUrl = this.normalizeUrl(url);
-            if (!seen.has(cleanUrl)) {
-                seen.add(cleanUrl);
-                this.uniqueUrls.push(cleanUrl);
-            }
-        }
-        
-        console.log(`Deduplicated to ${this.uniqueUrls.length} unique URLs`);
-    }
-    
-    // Filter media URLs with corresponding CDN URLs
-    filterMediaUrls() {
-        // Create a Map for faster lookups instead of using Set + string conversion
-        const urlMap = new Map();
-        
-        // First pass - normalize and index all URLs
-        for (const url of this.uniqueUrls) {
-            try {
-                const parsedUrl = new URL(url);
-                const hostname = parsedUrl.hostname.toLowerCase();
-                
-                // Use hostname as part of the key for better matching
-                urlMap.set(hostname + parsedUrl.pathname, url);
-            } catch (e) {
-                console.warn(`Invalid URL skipped: ${url}`);
-            }
-        }
-        
-        // Second pass - filter media URLs with CDN equivalents
-        const filteredUrls = [];
-        
-        for (const url of this.uniqueUrls) {
-            try {
-                const parsedUrl = new URL(url);
-                const hostname = parsedUrl.hostname.toLowerCase();
-                
-                // Check if this is a media URL with a potential CDN equivalent
-                if (hostname.startsWith('media.') && hostname.endsWith('.net')) {
-                    const whateverPart = hostname.substring(6, hostname.length - 4);
-                    const cdnHostname = `cdn.${whateverPart}.com`;
-                    
-                    // Create the potential CDN URL path key
-                    const cdnKey = cdnHostname + parsedUrl.pathname;
-                    
-                    // Skip if we have the CDN version
-                    if (urlMap.has(cdnKey)) {
-                        continue;
-                    }
-                }
-                
-                filteredUrls.push(url);
-            } catch (e) {
-                console.warn(`Error processing URL: ${url}`);
-                filteredUrls.push(url); // Include it anyway to be safe
-            }
-        }
-        
-        this.uniqueUrls = filteredUrls;
-        console.log(`Filtered to ${this.uniqueUrls.length} URLs after media/CDN deduplication`);
-    }
-    
-    // Save URLs to BetterDiscord storage
     saveUrlsToFile() {
         BdApi.Data.save("InfiniteGifs", "media_urls", this.uniqueUrls);
-        console.log(`Saved ${this.uniqueUrls.length} URLs to BetterDiscord storage`);
+        console.log(`Saved ${this.uniqueUrls.length} URLs to storage`);
     }
 }
 
