@@ -2,1382 +2,2691 @@
  * @name InfiniteGifs
  * @author VWilk
  * @authorId 363358047784927234
- * @version 1.3.0
- * @description A professional BetterDiscord plugin for fetching and managing GIFs from various sources
+ * @version 2.2.0
+ * @description Extracts GIF/media URLs from Discord/base64 data, downloads them as a zip, and adds a BetterGifs button to the expression picker.
  * @source https://github.com/VWilk/InfiniteGifsBD
  * @updateUrl https://raw.githubusercontent.com/VWilk/InfiniteGifsBD/main/InfiniteGifs.plugin.js
  */
 
-const CONFIG = {
-    info: {
-        name: "InfiniteGifs",
-        authors: [{
-            name: "VWilk",
-            discord_id: "363358047784927234"
-        }],
-        version: "1.3.0",
-        description: "A professional BetterDiscord plugin for fetching and managing GIFs from various sources",
-        github: "https://github.com/VWilk/InfiniteGifsBD",
-    },
-    changelog: [
-        {
-            title: "Version 1.3.0",
-            type: "improved",
-            items: [
-                "Added visual progress modal for downloads",
-                "Implemented smart retry mechanism with exponential backoff",
-                "Improved error handling and recovery",
-                "Optimized batch processing for better performance",
-                "Enhanced filename generation",
-                "Added rate limit detection and smart delays",
-                "Fixed settings panel functionality",
-                "Improved memory management"
-            ]
-        }
-    ],
-    defaultConfig: [
-        {
-            type: "category",
-            id: "dataSource",
-            name: "Data Source Configuration",
-            collapsible: true,
-            shown: true,
-            settings: [
-                {
-                    type: "text",
-                    id: "base64Data",
-                    name: "Base64 Encoded Data",
-                    note: "Upload or paste your base64 encoded GIF data here",
-                    value: ""
-                }
-            ]
-        },
-        {
-            type: "category",
-            id: "downloadSettings",
-            name: "Download Settings",
-            collapsible: true,
-            shown: false,
-            settings: [
-                {
-                    type: "switch",
-                    id: "enableBatchDownload",
-                    name: "Enable Batch Downloads",
-                    note: "Allow downloading multiple files simultaneously",
-                    value: true
-                },
-                {
-                    type: "text",
-                    id: "batchSize",
-                    name: "Batch Size",
-                    note: "Number of files to download simultaneously (1-10)",
-                    value: "3"
-                },
-                {
-                    type: "text",
-                    id: "downloadDelay",
-                    name: "Download Delay (ms)",
-                    note: "Delay between downloads to avoid rate limiting",
-                    value: "1000"
-                }
-            ]
-        }
-    ]
+const PLUGIN_ID = "InfiniteGifs";
+const JSZIP_URL = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+const BUTTON_ID = "bettergifs-picker-tab";
+const MODAL_ID = "bettergifs-modal";
+const STYLE_ID = "bettergifs-styles";
+const MEDIA_URL_RE = /https:\/\/[^\s"'`<>\\]+/gi;
+const MEDIA_EXT_RE = /\.(gif|mp4|webm|webp|png|jpe?g)(?:$|[?#])/i;
+const DISCORD_MEDIA_RE = /(?:cdn|media)\.discordapp\.(?:com|net)/i;
+const KNOWN_MEDIA_HOST_RE = /(tenor\.com|giphy\.com)$/i;
+const SETTINGS_PROTO_RE = /\/settings-proto\/2(?:[/?#]|$)/i;
+const MYGIF_PREVIEW_CACHE_LIMIT = 80;
+const MYGIF_LIBRARY_PAGE_SIZE = 36;
+const DEFAULTS = {
+    base64Data: ""
 };
 
-class InfiniteGifs {
+module.exports = class InfiniteGifs {
     constructor() {
-        this.settings = this.loadSettings();
-        this.mediaUrls = [];
-        this.downloadState = {
-            isActive: false,
-            current: 0,
-            total: 0,
-            successful: 0,
-            failed: 0,
-            cancelled: false
+        this.settings = this.loadData("settings", DEFAULTS);
+        this.mediaUrls = this.loadData("media_urls", [])
+            .map(url => this.resolvePreferredMediaUrl(url))
+            .filter(url => this.isMediaUrl(url));
+        this.myGifs = this.loadData("my_gifs", []).map(entry => this.normalizeMyGifEntry(entry)).filter(Boolean);
+        this.modal = null;
+        this.observer = null;
+        this.unpatchContextMenu = null;
+        this.abortController = null;
+        this.originalFetch = null;
+        this.originalXHROpen = null;
+        this.originalXHRSend = null;
+        this.panelRefreshers = new Set();
+        this.favoriteScanTimer = null;
+        this.favoriteCrawlRunning = false;
+        this.favoriteCrawlToken = 0;
+        this.lastAutoCrawlPanel = null;
+        this.previewObjectUrls = new Map();
+        this.previewLoads = new Map();
+        this.deadMyGifIds = new Set();
+        this.captureState = {
+            lastUrl: "",
+            lastSource: "",
+            lastAdded: 0,
+            lastSize: 0,
+            lastCaptureAt: 0,
+            lastPayloadText: "",
+            lastPayloadVariants: [],
+            lastTotalSeen: 0
         };
-        this.fileSaverLoaded = false;
-        this.jsZipLoaded = false;
-        this.tempBase64Data = null;
-        this.requestQueue = [];
-        this.maxConcurrentRequests = 3;
-        this.activeRequests = 0;
-        this.maxBase64Size = 100 * 1024 * 1024; // 100MB
-        this.progressModal = null;
-        this.statsContainer = null;
-        this.statsGrid = null;
     }
 
-    // ### Lifecycle Methods
-
-    async start() {
-        this.log("Plugin started");
-        await this.loadMediaUrls();
-        await this.decodeBase64Data();
+    start() {
+        this.injectStyles();
+        this.observeGifPicker();
+        this.injectPickerButton();
+        this.patchMessageContextMenu();
+        this.installNetworkInterceptors();
+        if (this.settings.base64Data) {
+            this.processInput(this.settings.base64Data).catch(error => this.logError("Startup processing failed", error));
+        }
     }
 
     stop() {
-        this.log("Plugin stopped");
-        this.cancelDownload();
-        this.cleanup();
+        this.abortController?.abort();
+        this.abortController = null;
+        this.revokePreviewCache();
+        clearTimeout(this.favoriteScanTimer);
+        this.favoriteScanTimer = null;
+        this.favoriteCrawlRunning = false;
+        this.favoriteCrawlToken += 1;
+        this.lastAutoCrawlPanel = null;
+        this.unpatchContextMenu?.();
+        this.unpatchContextMenu = null;
+        this.uninstallNetworkInterceptors();
+        this.observer?.disconnect();
+        this.observer = null;
+        this.panelRefreshers.clear();
+        document.getElementById(BUTTON_ID)?.remove();
+        this.closeModal();
+        BdApi.DOM.removeStyle(STYLE_ID);
     }
 
-    cleanup() {
-        this.requestQueue = [];
-        this.activeRequests = 0;
-        this.tempBase64Data = null;
-        if (this.progressModal) {
-            this.progressModal.remove();
-            this.progressModal = null;
+    getSettingsPanel() {
+        return this.buildSettingsPanel({ embedded: true });
+    }
+
+    loadData(key, fallback) {
+        try {
+            return BdApi.Data.load(PLUGIN_ID, key) ?? fallback;
+        } catch (error) {
+            this.logError(`Failed to load ${key}`, error);
+            return fallback;
         }
     }
 
-    // ### Settings Management
-
-    loadSettings() {
+    saveData(key, value) {
         try {
-            const saved = BdApi.Data.load("InfiniteGifs", "settings");
-            return saved || this.deepClone(CONFIG.defaultConfig);
+            BdApi.Data.save(PLUGIN_ID, key, value);
         } catch (error) {
-            this.logError("Failed to load settings", error);
-            return this.deepClone(CONFIG.defaultConfig);
+            this.logError(`Failed to save ${key}`, error);
         }
     }
 
     saveSettings() {
+        this.saveData("settings", this.settings);
+    }
+
+    saveMediaUrls() {
+        this.saveData("media_urls", this.mediaUrls);
+    }
+
+    saveMyGifs() {
+        this.saveData("my_gifs", this.myGifs);
+    }
+
+    injectStyles() {
+        if (document.getElementById(STYLE_ID)) return;
+
+        BdApi.DOM.addStyle(STYLE_ID, `
+            #${MODAL_ID} {
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.7);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 10000;
+            }
+            #${MODAL_ID} .bettergifs-panel {
+                width: min(720px, calc(100vw - 32px));
+                max-height: calc(100vh - 32px);
+                overflow: auto;
+                background: var(--background-primary, #313338);
+                color: var(--text-normal, #dbdee1);
+                border: 1px solid var(--border-subtle, #3f4147);
+                border-radius: 12px;
+                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+            }
+            .bettergifs-panel {
+                padding: 16px;
+            }
+            .bettergifs-row {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+                margin-top: 12px;
+            }
+            .bettergifs-title {
+                font-size: 18px;
+                font-weight: 700;
+                margin: 0 0 8px;
+            }
+            .bettergifs-subtitle {
+                color: var(--text-muted, #b5bac1);
+                font-size: 13px;
+                margin-bottom: 12px;
+            }
+            .bettergifs-stats {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+                gap: 8px;
+                margin-bottom: 12px;
+            }
+            .bettergifs-card {
+                background: var(--background-secondary, #2b2d31);
+                border-radius: 8px;
+                padding: 10px;
+            }
+            .bettergifs-card strong {
+                display: block;
+                font-size: 18px;
+                margin-bottom: 4px;
+            }
+            .bettergifs-textarea {
+                width: 100%;
+                min-height: 180px;
+                resize: vertical;
+                border: 1px solid var(--border-faint, #4e5058);
+                border-radius: 8px;
+                padding: 10px;
+                box-sizing: border-box;
+                background: var(--input-background, #1e1f22);
+                color: var(--text-normal, #dbdee1);
+                font-family: Consolas, monospace;
+            }
+            .bettergifs-status {
+                margin-top: 10px;
+                min-height: 18px;
+                color: var(--text-muted, #b5bac1);
+                font-size: 13px;
+            }
+            .bettergifs-btn {
+                border: 0;
+                border-radius: 8px;
+                padding: 8px 12px;
+                cursor: pointer;
+                font-weight: 600;
+                color: white;
+            }
+            .bettergifs-btn.primary { background: #5865f2; }
+            .bettergifs-btn.success { background: #248046; }
+            .bettergifs-btn.warn { background: #e67e22; }
+            .bettergifs-btn.danger { background: #da373c; }
+            .bettergifs-btn.ghost {
+                background: var(--background-secondary, #2b2d31);
+                color: var(--text-normal, #dbdee1);
+                border: 1px solid var(--border-faint, #4e5058);
+            }
+            .bettergifs-section {
+                margin-top: 16px;
+                padding-top: 16px;
+                border-top: 1px solid var(--border-subtle, #3f4147);
+            }
+            .bettergifs-section-title {
+                font-size: 16px;
+                font-weight: 700;
+                margin: 0 0 6px;
+            }
+            .bettergifs-section-subtitle {
+                color: var(--text-muted, #b5bac1);
+                font-size: 12px;
+                margin-bottom: 10px;
+            }
+            .bettergifs-input, .bettergifs-select {
+                min-width: 0;
+                flex: 1 1 140px;
+                border: 1px solid var(--border-faint, #4e5058);
+                border-radius: 8px;
+                padding: 8px 10px;
+                box-sizing: border-box;
+                background: var(--input-background, #1e1f22);
+                color: var(--text-normal, #dbdee1);
+            }
+            .bettergifs-library-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 10px;
+                margin-top: 12px;
+                max-height: 420px;
+                overflow: auto;
+                align-content: start;
+            }
+            .bettergifs-library-item {
+                background: var(--background-secondary, #2b2d31);
+                border: 1px solid var(--border-subtle, #3f4147);
+                border-radius: 8px;
+                overflow: hidden;
+            }
+            .bettergifs-library-preview {
+                width: 100%;
+                aspect-ratio: 1 / 1;
+                background: rgba(0, 0, 0, 0.2);
+                display: block;
+                object-fit: cover;
+            }
+            .bettergifs-library-body {
+                padding: 10px;
+            }
+            .bettergifs-library-name {
+                font-weight: 700;
+                margin-bottom: 4px;
+                word-break: break-word;
+            }
+            .bettergifs-library-meta {
+                color: var(--text-muted, #b5bac1);
+                font-size: 12px;
+                margin-bottom: 8px;
+                word-break: break-word;
+            }
+            .bettergifs-tag-row {
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+                margin-bottom: 8px;
+            }
+            .bettergifs-tag {
+                background: rgba(88, 101, 242, 0.18);
+                color: var(--text-normal, #dbdee1);
+                border-radius: 999px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }
+            .bettergifs-empty {
+                color: var(--text-muted, #b5bac1);
+                font-size: 13px;
+                padding: 16px 0 4px;
+            }
+            .bettergifs-picker-panel {
+                width: min(1040px, calc(100vw - 24px));
+                max-height: calc(100vh - 24px);
+                padding: 14px;
+                overflow: hidden;
+            }
+            .bettergifs-picker-shell {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) 280px;
+                gap: 14px;
+                min-height: 620px;
+            }
+            .bettergifs-picker-main,
+            .bettergifs-picker-side {
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+            .bettergifs-picker-topbar {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }
+            .bettergifs-picker-heading {
+                font-size: 18px;
+                font-weight: 700;
+                margin: 0;
+            }
+            .bettergifs-picker-caption {
+                color: var(--text-muted, #b5bac1);
+                font-size: 12px;
+            }
+            .bettergifs-picker-actions {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .bettergifs-toolbar {
+                display: grid;
+                grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(140px, 0.55fr));
+                gap: 8px;
+            }
+            .bettergifs-chipbar {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+            }
+            .bettergifs-chip {
+                border: 1px solid var(--border-faint, #4e5058);
+                background: var(--background-secondary, #2b2d31);
+                color: var(--text-normal, #dbdee1);
+                border-radius: 999px;
+                padding: 5px 10px;
+                cursor: pointer;
+                font-size: 12px;
+            }
+            .bettergifs-chip.active {
+                background: rgba(88, 101, 242, 0.22);
+                border-color: rgba(88, 101, 242, 0.55);
+            }
+            .bettergifs-picker-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+                gap: 10px;
+                overflow: auto;
+                padding-right: 2px;
+                align-content: start;
+                min-height: 320px;
+            }
+            .bettergifs-picker-card {
+                position: relative;
+                border-radius: 8px;
+                overflow: hidden;
+                background: var(--background-secondary, #2b2d31);
+                border: 1px solid var(--border-subtle, #3f4147);
+                cursor: pointer;
+                padding: 0;
+                color: inherit;
+                text-align: left;
+            }
+            .bettergifs-picker-card.active {
+                border-color: rgba(88, 101, 242, 0.9);
+                box-shadow: 0 0 0 1px rgba(88, 101, 242, 0.45);
+            }
+            .bettergifs-picker-card::after {
+                content: "";
+                position: absolute;
+                inset: auto 0 0 0;
+                height: 42%;
+                background: linear-gradient(to top, rgba(0,0,0,0.72), rgba(0,0,0,0));
+                pointer-events: none;
+            }
+            .bettergifs-picker-preview {
+                width: 100%;
+                aspect-ratio: 1 / 1;
+                object-fit: cover;
+                display: block;
+                background: rgba(255,255,255,0.04);
+            }
+            .bettergifs-picker-skeleton {
+                position: absolute;
+                inset: 0;
+                background: linear-gradient(90deg, rgba(255,255,255,0.05), rgba(255,255,255,0.11), rgba(255,255,255,0.05));
+                background-size: 220px 100%;
+                animation: bettergifsShimmer 1.25s linear infinite;
+                pointer-events: none;
+            }
+            .bettergifs-picker-card.ready .bettergifs-picker-skeleton {
+                display: none;
+            }
+            .bettergifs-picker-overlay {
+                position: absolute;
+                inset: auto 8px 8px 8px;
+                display: flex;
+                align-items: flex-end;
+                justify-content: space-between;
+                gap: 8px;
+                z-index: 1;
+            }
+            .bettergifs-picker-label {
+                min-width: 0;
+            }
+            .bettergifs-picker-name {
+                font-size: 12px;
+                font-weight: 700;
+                color: white;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .bettergifs-picker-meta {
+                color: rgba(255, 255, 255, 0.78);
+                font-size: 11px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .bettergifs-picker-quick {
+                display: flex;
+                gap: 4px;
+                opacity: 0;
+                transition: opacity 120ms ease;
+            }
+            .bettergifs-picker-card:hover .bettergifs-picker-quick,
+            .bettergifs-picker-card:focus-within .bettergifs-picker-quick,
+            .bettergifs-picker-card.active .bettergifs-picker-quick {
+                opacity: 1;
+            }
+            .bettergifs-mini-btn {
+                border: 1px solid rgba(255,255,255,0.15);
+                background: rgba(17, 18, 20, 0.78);
+                color: white;
+                border-radius: 7px;
+                padding: 4px 8px;
+                cursor: pointer;
+                font-size: 11px;
+            }
+            .bettergifs-panel-card {
+                background: var(--background-secondary, #2b2d31);
+                border: 1px solid var(--border-subtle, #3f4147);
+                border-radius: 8px;
+                padding: 12px;
+            }
+            .bettergifs-side-title {
+                font-size: 13px;
+                font-weight: 700;
+                margin-bottom: 8px;
+            }
+            .bettergifs-side-subtitle {
+                color: var(--text-muted, #b5bac1);
+                font-size: 12px;
+                margin-bottom: 10px;
+            }
+            .bettergifs-detail-preview {
+                width: 100%;
+                aspect-ratio: 1 / 1;
+                border-radius: 8px;
+                object-fit: cover;
+                background: rgba(255,255,255,0.04);
+                display: block;
+                margin-bottom: 10px;
+            }
+            .bettergifs-stack {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            .bettergifs-countline {
+                color: var(--text-muted, #b5bac1);
+                font-size: 12px;
+            }
+            .bettergifs-collapse-head {
+                width: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                border: 0;
+                background: transparent;
+                color: inherit;
+                padding: 0;
+                cursor: pointer;
+                font: inherit;
+            }
+            .bettergifs-advanced {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+            .bettergifs-hidden {
+                display: none !important;
+            }
+            @keyframes bettergifsShimmer {
+                from { background-position: -220px 0; }
+                to { background-position: 220px 0; }
+            }
+            @media (max-width: 900px) {
+                .bettergifs-picker-panel {
+                    width: min(100vw - 16px, 760px);
+                }
+                .bettergifs-picker-shell {
+                    grid-template-columns: 1fr;
+                    min-height: 0;
+                }
+                .bettergifs-toolbar {
+                    grid-template-columns: 1fr;
+                }
+            }
+        `);
+    }
+
+    observeGifPicker() {
+        this.observer?.disconnect();
+        this.observer = new MutationObserver(() => {
+            this.injectPickerButton();
+            this.scheduleFavoriteScan();
+        });
+        this.observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    injectPickerButton() {
+        if (document.getElementById(BUTTON_ID)) return;
+
+        const navList =
+            document.querySelector('[aria-label="Expression Picker Categories"]') ||
+            document.querySelector('[role="tablist"][aria-label*="Expression Picker"]');
+
+        if (!navList) return;
+
+        const template =
+            navList.querySelector('[role="tab"]') ||
+            navList.firstElementChild;
+
+        const button = document.createElement("div");
+        button.id = BUTTON_ID;
+        button.role = "tab";
+        button.tabIndex = 0;
+        button.ariaLabel = "BetterGifs";
+        button.ariaSelected = "false";
+        button.className = template?.className || "";
+        button.textContent = "BetterGifs";
+        button.addEventListener("click", () => this.openModal());
+        button.addEventListener("keydown", event => {
+            if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                this.openModal();
+            }
+        });
+        navList.appendChild(button);
+    }
+
+    patchMessageContextMenu() {
         try {
-            BdApi.Data.save("InfiniteGifs", "settings", this.settings);
+            this.unpatchContextMenu = BdApi.ContextMenu.patch("message", (tree, props) => {
+                if (!props?.message) return tree;
+
+                const urls = this.extractMediaFromMessage(props.message);
+                if (!urls.length) return tree;
+
+                tree.props.children.push(BdApi.ContextMenu.buildItem({
+                    label: "InfiniteGifs",
+                    children: [
+                        {
+                            label: `Add ${urls.length} media URL${urls.length === 1 ? "" : "s"}`,
+                            action: () => this.addUrls(urls)
+                        },
+                        {
+                            label: "Download as ZIP",
+                            action: () => this.downloadUrlsAsZip(urls)
+                        }
+                    ]
+                }));
+
+                return tree;
+            });
         } catch (error) {
-            this.logError("Failed to save settings", error);
+            this.logError("Failed to patch message context menu", error);
         }
     }
 
-    findSetting(id) {
-        for (const category of this.settings) {
-            const setting = category.settings.find(s => s.id === id);
-            if (setting) return setting;
+    buildSettingsPanel({ embedded = false } = {}) {
+        const root = document.createElement("div");
+        root.className = "bettergifs-panel";
+
+        const title = document.createElement("div");
+        title.className = "bettergifs-title";
+        title.textContent = embedded ? "InfiniteGifs" : "BetterGifs";
+
+        const subtitle = document.createElement("div");
+        subtitle.className = "bettergifs-subtitle";
+        subtitle.textContent = "Capture URLs from the Discord GIF favourites tab, or paste raw protobuf/base64 text as a fallback.";
+
+        const stats = document.createElement("div");
+        stats.className = "bettergifs-stats";
+
+        const textarea = document.createElement("textarea");
+        textarea.className = "bettergifs-textarea";
+        textarea.placeholder = "Paste Discord/base64/protobuf-looking text here...";
+        textarea.value = this.settings.base64Data || "";
+
+        const fileInput = document.createElement("input");
+        fileInput.type = "file";
+        fileInput.accept = ".txt,.json,.log";
+        fileInput.style.display = "none";
+
+        const librarySection = document.createElement("div");
+        librarySection.className = "bettergifs-section";
+
+        const libraryTitle = document.createElement("div");
+        libraryTitle.className = "bettergifs-section-title";
+        libraryTitle.textContent = "My GIFs";
+
+        const librarySubtitle = document.createElement("div");
+        librarySubtitle.className = "bettergifs-section-subtitle";
+        librarySubtitle.textContent = "Keep a local library with folders and tags. This is the base we can later wire into its own picker view.";
+
+        const libraryFormRow = document.createElement("div");
+        libraryFormRow.className = "bettergifs-row";
+
+        const libraryUrlInput = document.createElement("input");
+        libraryUrlInput.className = "bettergifs-input";
+        libraryUrlInput.placeholder = "GIF URL";
+
+        const libraryTitleInput = document.createElement("input");
+        libraryTitleInput.className = "bettergifs-input";
+        libraryTitleInput.placeholder = "Title (optional)";
+
+        const libraryFolderInput = document.createElement("input");
+        libraryFolderInput.className = "bettergifs-input";
+        libraryFolderInput.placeholder = "Folder";
+
+        const libraryTagsInput = document.createElement("input");
+        libraryTagsInput.className = "bettergifs-input";
+        libraryTagsInput.placeholder = "Tags, comma separated";
+
+        libraryFormRow.append(libraryUrlInput, libraryTitleInput, libraryFolderInput, libraryTagsInput);
+
+        const libraryActionRow = document.createElement("div");
+        libraryActionRow.className = "bettergifs-row";
+
+        const librarySearchRow = document.createElement("div");
+        librarySearchRow.className = "bettergifs-row";
+
+        const librarySearchInput = document.createElement("input");
+        librarySearchInput.className = "bettergifs-input";
+        librarySearchInput.placeholder = "Search title, folder, tags, or URL";
+
+        const libraryFolderFilter = document.createElement("select");
+        libraryFolderFilter.className = "bettergifs-select";
+
+        const libraryGrid = document.createElement("div");
+        libraryGrid.className = "bettergifs-library-grid";
+        let libraryRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+        let libraryObserver = null;
+
+        const status = document.createElement("div");
+        status.className = "bettergifs-status";
+
+        const cleanupLibraryObserver = () => {
+            if (libraryObserver) {
+                libraryObserver.disconnect();
+                libraryObserver = null;
+            }
+            for (const node of libraryGrid.querySelectorAll(".bettergifs-library-preview")) {
+                this.deactivatePreview(node);
+            }
+        };
+
+        const renderLibraryGrid = () => {
+            const previousFolder = libraryFolderFilter.value || "";
+            libraryFolderFilter.replaceChildren();
+            libraryFolderFilter.appendChild(new Option("All folders", ""));
+            for (const folder of this.getMyGifFolders()) {
+                libraryFolderFilter.appendChild(new Option(folder, folder));
+            }
+            libraryFolderFilter.value = [...libraryFolderFilter.options].some(option => option.value === previousFolder) ? previousFolder : "";
+
+            const filtered = this.getFilteredMyGifs({
+                query: librarySearchInput.value,
+                folder: libraryFolderFilter.value
+            });
+
+            cleanupLibraryObserver();
+            libraryGrid.replaceChildren();
+            if (!filtered.length) {
+                const empty = document.createElement("div");
+                empty.className = "bettergifs-empty";
+                empty.textContent = this.myGifs.length ? "No library items match the current filter." : "No local GIFs saved yet.";
+                libraryGrid.appendChild(empty);
+            } else {
+                const visibleEntries = filtered.slice(0, libraryRenderCount);
+                libraryObserver = new IntersectionObserver(entries => {
+                    for (const intersection of entries) {
+                        const preview = intersection.target;
+                        if (intersection.isIntersecting) this.activatePreview(preview);
+                        else this.deactivatePreview(preview);
+                    }
+                }, {
+                    root: libraryGrid,
+                    rootMargin: "160px 0px",
+                    threshold: 0.01
+                });
+
+                for (const entry of visibleEntries) {
+                    const card = this.createMyGifCard(entry, {
+                        onCopy: async () => {
+                            const copied = await this.copyText(entry.url);
+                            if (copied) refreshStats("Copied GIF URL");
+                        },
+                        onOpen: () => {
+                            window.open(entry.url, "_blank", "noopener,noreferrer");
+                            refreshStats(`Opened ${entry.title || "GIF"}`);
+                        },
+                        onRemove: () => {
+                            this.removeMyGif(entry.id);
+                            refreshStats(`Removed ${entry.title || "GIF"} from My GIFs`);
+                        }
+                    });
+                    libraryGrid.appendChild(card);
+                    const preview = card.querySelector(".bettergifs-library-preview");
+                    if (preview) libraryObserver.observe(preview);
+                }
+            }
+        };
+
+        const refreshStats = (message = "") => {
+            const counts = this.getCounts();
+            stats.replaceChildren(
+                this.createStatCard("Stored", counts.total),
+                this.createStatCard("GIF", counts.gif),
+                this.createStatCard("MP4", counts.mp4),
+                this.createStatCard("WEBM", counts.webm),
+                this.createStatCard("My GIFs", this.myGifs.length)
+            );
+
+            renderLibraryGrid();
+            status.textContent = message || this.formatCaptureStatus();
+        };
+
+        this.panelRefreshers.add(refreshStats);
+        root.__betterGifsCleanup = () => {
+            cleanupLibraryObserver();
+            this.panelRefreshers.delete(refreshStats);
+        };
+
+        const persistTextarea = () => {
+            this.settings.base64Data = textarea.value;
+            this.saveSettings();
+        };
+
+        textarea.addEventListener("input", persistTextarea);
+
+        fileInput.addEventListener("change", async event => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+
+            try {
+                textarea.value = await file.text();
+                persistTextarea();
+                refreshStats(`Loaded ${file.name}`);
+            } catch (error) {
+                this.logError("Failed to read file", error);
+                refreshStats("Failed to read file");
+            }
+        });
+
+        const row1 = document.createElement("div");
+        row1.className = "bettergifs-row";
+        row1.append(
+            this.createButton("Capture favourites", "primary", () => {
+                const added = this.captureFavoritesFromDom({ source: "favourites-dom-manual", notify: true });
+                refreshStats(added ? `Captured ${added} new favourite URL${added === 1 ? "" : "s"}` : "No new favourite URLs found in the open Favourites tab");
+            }),
+            this.createButton("Capture all favourites", "primary", async () => {
+                if (this.favoriteCrawlRunning) {
+                    refreshStats("Already scanning the full favourites list");
+                    return;
+                }
+                refreshStats("Scanning the full favourites list...");
+                const result = await this.captureAllFavorites(message => refreshStats(message));
+                if (!result) {
+                    refreshStats("Open the GIF Favourites tab first");
+                    return;
+                }
+                refreshStats(`Full scan complete: saw ${result.seen} item${result.seen === 1 ? "" : "s"}, added ${result.added} new URL${result.added === 1 ? "" : "s"}`);
+            }),
+            this.createButton("Process input", "primary", async () => {
+                persistTextarea();
+                const added = await this.processInput(textarea.value);
+                refreshStats(added ? `Added ${added} new URL${added === 1 ? "" : "s"}` : "No new media URLs found");
+            }),
+            this.createButton("Load file", "ghost", () => fileInput.click()),
+            this.createButton("Export URLs", "success", () => {
+                this.exportUrlList();
+                refreshStats(`Exported ${this.mediaUrls.length} URL${this.mediaUrls.length === 1 ? "" : "s"}`);
+            }),
+            this.createButton("Download ZIP", "success", async () => {
+                refreshStats("Downloading ZIP...");
+                await this.downloadUrlsAsZip(this.mediaUrls, message => refreshStats(message));
+            })
+        );
+
+        const row2 = document.createElement("div");
+        row2.className = "bettergifs-row";
+        row2.append(
+            this.createButton("Process saved text", "warn", async () => {
+                const added = await this.processInput(this.settings.base64Data || "");
+                refreshStats(added ? `Added ${added} new URL${added === 1 ? "" : "s"}` : "No new media URLs found");
+            }),
+            this.createButton("Clear stored URLs", "danger", () => {
+                this.mediaUrls = [];
+                this.saveMediaUrls();
+                refreshStats("Cleared stored URLs");
+            }),
+            this.createButton("Clear saved text", "ghost", () => {
+                textarea.value = "";
+                this.settings.base64Data = "";
+                this.saveSettings();
+                refreshStats("Cleared saved text");
+            }),
+            this.createButton("Save last proto capture", "ghost", () => {
+                if (!this.captureState.lastPayloadText) {
+                    refreshStats("No /settings-proto/2 payload captured yet");
+                    return;
+                }
+                this.saveRawCapture();
+                refreshStats("Saved last /settings-proto/2 payload");
+            }),
+            this.createButton("Process last proto capture", "warn", async () => {
+                if (!this.captureState.lastPayloadText) {
+                    refreshStats("No /settings-proto/2 payload captured yet");
+                    return;
+                }
+                const added = await this.processCapturedPayload();
+                refreshStats(added ? `Added ${added} new URL${added === 1 ? "" : "s"} from /settings-proto/2` : "No new media URLs found in last /settings-proto/2 capture");
+            })
+        );
+
+        libraryActionRow.append(
+            this.createButton("Add to My GIFs", "primary", () => {
+                const result = this.upsertMyGif({
+                    url: libraryUrlInput.value,
+                    title: libraryTitleInput.value,
+                    folder: libraryFolderInput.value,
+                    tags: libraryTagsInput.value
+                });
+                if (!result) {
+                    refreshStats("Enter a valid media URL for My GIFs");
+                    return;
+                }
+                libraryUrlInput.value = "";
+                libraryTitleInput.value = "";
+                libraryTagsInput.value = "";
+                refreshStats(`${result.created ? "Added" : "Updated"} ${result.entry.title || "GIF"} in My GIFs`);
+            }),
+            this.createButton("Import stored URLs", "success", async () => {
+                refreshStats("Checking stored URLs before import...");
+                const result = await this.importMediaUrlsToMyGifs({ folder: libraryFolderInput.value, tags: libraryTagsInput.value });
+                if (result.added) {
+                    refreshStats(`Imported ${result.added} stored URL${result.added === 1 ? "" : "s"} into My GIFs${result.skipped ? `, skipped ${result.skipped} unavailable` : ""}`);
+                } else {
+                    refreshStats(result.skipped ? `Skipped ${result.skipped} unavailable stored URL${result.skipped === 1 ? "" : "s"}` : "No new stored URLs to import");
+                }
+            }),
+            this.createButton("Export My GIFs", "ghost", async () => {
+                refreshStats("Checking My GIFs availability...");
+                const result = await this.exportMyGifs();
+                if (result?.exported) {
+                    const skipped = result.skipped;
+                    refreshStats(`Exported ${result.exported} My GIF${result.exported === 1 ? "" : "s"}${skipped ? `, skipped ${skipped} unavailable` : ""}`);
+                } else if (result?.skipped) {
+                    refreshStats(`Skipped ${result.skipped} unavailable GIF${result.skipped === 1 ? "" : "s"} and exported none`);
+                }
+            }),
+            this.createButton("Clear My GIFs", "danger", () => {
+                this.myGifs = [];
+                this.saveMyGifs();
+                refreshStats("Cleared My GIFs");
+            })
+        );
+
+        librarySearchRow.append(librarySearchInput, libraryFolderFilter);
+
+        librarySearchInput.addEventListener("input", () => {
+            libraryRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+            refreshStats();
+        });
+        libraryFolderFilter.addEventListener("change", () => {
+            libraryRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+            refreshStats();
+        });
+        libraryGrid.addEventListener("scroll", () => {
+            const nearBottom = libraryGrid.scrollTop + libraryGrid.clientHeight >= libraryGrid.scrollHeight - 200;
+            if (!nearBottom) return;
+
+            const filteredCount = this.getFilteredMyGifs({
+                query: librarySearchInput.value,
+                folder: libraryFolderFilter.value
+            }).length;
+            if (libraryRenderCount >= filteredCount) return;
+
+            libraryRenderCount = Math.min(filteredCount, libraryRenderCount + MYGIF_LIBRARY_PAGE_SIZE);
+            renderLibraryGrid();
+        });
+
+        librarySection.append(
+            libraryTitle,
+            librarySubtitle,
+            libraryFormRow,
+            libraryActionRow,
+            librarySearchRow,
+            libraryGrid
+        );
+
+        root.append(title, subtitle, stats, textarea, fileInput, row1, row2, librarySection, status);
+
+        if (!embedded) {
+            const closeRow = document.createElement("div");
+            closeRow.className = "bettergifs-row";
+            closeRow.append(this.createButton("Close", "ghost", () => this.closeModal()));
+            root.append(closeRow);
         }
-        return null;
+
+        refreshStats();
+        return root;
     }
 
-    getSettingValue(id) {
-        const setting = this.findSetting(id);
-        return setting?.value || null;
+    buildPickerPanel() {
+        const root = document.createElement("div");
+        root.className = "bettergifs-panel bettergifs-picker-panel";
+
+        const hiddenFileInput = document.createElement("input");
+        hiddenFileInput.type = "file";
+        hiddenFileInput.accept = ".txt,.json,.log";
+        hiddenFileInput.style.display = "none";
+
+        const hiddenTextarea = document.createElement("textarea");
+        hiddenTextarea.value = this.settings.base64Data || "";
+
+        const shell = document.createElement("div");
+        shell.className = "bettergifs-picker-shell";
+
+        const main = document.createElement("div");
+        main.className = "bettergifs-picker-main";
+
+        const side = document.createElement("div");
+        side.className = "bettergifs-picker-side";
+
+        const topbar = document.createElement("div");
+        topbar.className = "bettergifs-picker-topbar";
+
+        const titleWrap = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "bettergifs-picker-heading";
+        title.textContent = "My GIFs";
+        const caption = document.createElement("div");
+        caption.className = "bettergifs-picker-caption";
+        caption.textContent = "Your library first. Import, capture, and maintenance stay tucked into Advanced.";
+        titleWrap.append(title, caption);
+
+        const topActions = document.createElement("div");
+        topActions.className = "bettergifs-picker-actions";
+
+        const toolbar = document.createElement("div");
+        toolbar.className = "bettergifs-toolbar";
+
+        const searchInput = document.createElement("input");
+        searchInput.className = "bettergifs-input";
+        searchInput.placeholder = "Search title, folder, tags, or URL";
+
+        const folderSelect = document.createElement("select");
+        folderSelect.className = "bettergifs-select";
+
+        const tagInput = document.createElement("input");
+        tagInput.className = "bettergifs-input";
+        tagInput.placeholder = "Filter by tag";
+
+        toolbar.append(searchInput, folderSelect, tagInput);
+
+        const folderChips = document.createElement("div");
+        folderChips.className = "bettergifs-chipbar";
+
+        const addCard = document.createElement("div");
+        addCard.className = "bettergifs-panel-card bettergifs-hidden";
+
+        const addTitle = document.createElement("div");
+        addTitle.className = "bettergifs-side-title";
+        addTitle.textContent = "Add GIF";
+        const addRow = document.createElement("div");
+        addRow.className = "bettergifs-stack";
+
+        const addUrlInput = document.createElement("input");
+        addUrlInput.className = "bettergifs-input";
+        addUrlInput.placeholder = "GIF URL";
+        const addNameInput = document.createElement("input");
+        addNameInput.className = "bettergifs-input";
+        addNameInput.placeholder = "Title (optional)";
+        const addFolderInput = document.createElement("input");
+        addFolderInput.className = "bettergifs-input";
+        addFolderInput.placeholder = "Folder";
+        const addTagsInput = document.createElement("input");
+        addTagsInput.className = "bettergifs-input";
+        addTagsInput.placeholder = "Tags, comma separated";
+        const addActions = document.createElement("div");
+        addActions.className = "bettergifs-row";
+        addRow.append(addUrlInput, addNameInput, addFolderInput, addTagsInput, addActions);
+        addCard.append(addTitle, addRow);
+
+        const grid = document.createElement("div");
+        grid.className = "bettergifs-picker-grid";
+
+        const statusLine = document.createElement("div");
+        statusLine.className = "bettergifs-countline";
+
+        const detailCard = document.createElement("div");
+        detailCard.className = "bettergifs-panel-card";
+
+        const advancedCard = document.createElement("div");
+        advancedCard.className = "bettergifs-panel-card";
+        const advancedHead = document.createElement("button");
+        advancedHead.type = "button";
+        advancedHead.className = "bettergifs-collapse-head";
+        const advancedHeadLabel = document.createElement("div");
+        const advancedTitle = document.createElement("div");
+        advancedTitle.className = "bettergifs-side-title";
+        advancedTitle.textContent = "Advanced";
+        const advancedSubtitle = document.createElement("div");
+        advancedSubtitle.className = "bettergifs-side-subtitle";
+        advancedSubtitle.textContent = "Import, capture, cleanup, and protobuf tools.";
+        advancedHeadLabel.append(advancedTitle, advancedSubtitle);
+        const advancedToggleLabel = document.createElement("div");
+        advancedToggleLabel.className = "bettergifs-countline";
+        advancedHead.append(advancedHeadLabel, advancedToggleLabel);
+
+        const advancedBody = document.createElement("div");
+        advancedBody.className = "bettergifs-advanced bettergifs-hidden";
+
+        const advancedText = document.createElement("textarea");
+        advancedText.className = "bettergifs-textarea";
+        advancedText.placeholder = "Paste Discord/base64/protobuf-looking text here...";
+        advancedText.value = this.settings.base64Data || "";
+
+        const advancedRow1 = document.createElement("div");
+        advancedRow1.className = "bettergifs-row";
+        const advancedRow2 = document.createElement("div");
+        advancedRow2.className = "bettergifs-row";
+        const advancedRow3 = document.createElement("div");
+        advancedRow3.className = "bettergifs-row";
+
+        advancedBody.append(advancedText, hiddenFileInput, advancedRow1, advancedRow2, advancedRow3);
+        advancedCard.append(advancedHead, advancedBody);
+
+        let selectedId = "";
+        let pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+        let pickerObserver = null;
+        let addOpen = false;
+        let advancedOpen = false;
+
+        const persistAdvancedTextarea = () => {
+            this.settings.base64Data = advancedText.value;
+            this.saveSettings();
+            hiddenTextarea.value = advancedText.value;
+        };
+
+        advancedText.addEventListener("input", persistAdvancedTextarea);
+
+        hiddenFileInput.addEventListener("change", async event => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            try {
+                advancedText.value = await file.text();
+                persistAdvancedTextarea();
+                refreshPicker(`Loaded ${file.name}`);
+            } catch (error) {
+                this.logError("Failed to read file", error);
+                refreshPicker("Failed to read file");
+            }
+        });
+
+        const cleanupPickerObserver = () => {
+            if (pickerObserver) {
+                pickerObserver.disconnect();
+                pickerObserver = null;
+            }
+            for (const node of grid.querySelectorAll(".bettergifs-picker-preview")) {
+                this.deactivatePreview(node);
+            }
+            const detailPreview = detailCard.querySelector(".bettergifs-detail-preview");
+            if (detailPreview) this.deactivatePreview(detailPreview);
+        };
+
+        const getFilteredEntries = () => this.getFilteredMyGifs({
+            query: searchInput.value,
+            folder: folderSelect.value,
+            tagQuery: tagInput.value
+        });
+
+        const syncFolderControls = () => {
+            const previousFolder = folderSelect.value || "";
+            folderSelect.replaceChildren();
+            folderSelect.appendChild(new Option("All folders", ""));
+            for (const folder of this.getMyGifFolders()) {
+                folderSelect.appendChild(new Option(folder, folder));
+            }
+            folderSelect.value = [...folderSelect.options].some(option => option.value === previousFolder) ? previousFolder : "";
+
+            const folders = this.getMyGifFolders();
+            folderChips.replaceChildren();
+            const makeChip = (label, value) => {
+                const chip = document.createElement("button");
+                chip.type = "button";
+                chip.className = `bettergifs-chip${folderSelect.value === value ? " active" : ""}`;
+                chip.textContent = label;
+                chip.addEventListener("click", () => {
+                    folderSelect.value = value;
+                    pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+                    refreshPicker();
+                });
+                return chip;
+            };
+            folderChips.appendChild(makeChip("All", ""));
+            for (const folder of folders.slice(0, 8)) {
+                folderChips.appendChild(makeChip(folder, folder));
+            }
+        };
+
+        const renderDetails = currentEntry => {
+            const existingPreview = detailCard.querySelector(".bettergifs-detail-preview");
+            if (existingPreview) this.deactivatePreview(existingPreview);
+            detailCard.replaceChildren();
+
+            const detailTitle = document.createElement("div");
+            detailTitle.className = "bettergifs-side-title";
+            detailTitle.textContent = currentEntry ? "Details" : "Library";
+
+            const detailSubtitle = document.createElement("div");
+            detailSubtitle.className = "bettergifs-side-subtitle";
+            detailSubtitle.textContent = currentEntry
+                ? "Edit metadata without leaving the browser."
+                : "Select a GIF to edit title, folder, tags, or remove it.";
+
+            detailCard.append(detailTitle, detailSubtitle);
+
+            if (!currentEntry) return;
+
+            const previewCandidates = this.getAvailabilityCandidates(currentEntry);
+            const previewTag = previewCandidates.some(url => this.isVideoCandidate(url)) ? "video" : "img";
+            const preview = document.createElement(previewTag);
+            preview.className = "bettergifs-detail-preview";
+            if (previewTag === "video") {
+                preview.muted = true;
+                preview.loop = true;
+                preview.autoplay = true;
+                preview.playsInline = true;
+                preview.preload = "metadata";
+            } else {
+                preview.alt = currentEntry.title || "Selected GIF";
+                preview.loading = "lazy";
+            }
+            preview.__betterGifsEntryId = currentEntry.id;
+            preview.__betterGifsCandidates = previewCandidates;
+            detailCard.appendChild(preview);
+            this.activatePreview(preview);
+
+            const titleInput = document.createElement("input");
+            titleInput.className = "bettergifs-input";
+            titleInput.value = currentEntry.title || "";
+            titleInput.placeholder = "Title";
+
+            const folderInput = document.createElement("input");
+            folderInput.className = "bettergifs-input";
+            folderInput.value = currentEntry.folder || "";
+            folderInput.placeholder = "Folder";
+
+            const tagsInput = document.createElement("input");
+            tagsInput.className = "bettergifs-input";
+            tagsInput.value = currentEntry.tags.join(", ");
+            tagsInput.placeholder = "Tags, comma separated";
+
+            const urlLine = document.createElement("div");
+            urlLine.className = "bettergifs-countline";
+            urlLine.textContent = currentEntry.url;
+
+            const actionRow = document.createElement("div");
+            actionRow.className = "bettergifs-row";
+            actionRow.append(
+                this.createButton("Save", "primary", () => {
+                    const result = this.upsertMyGif({
+                        id: currentEntry.id,
+                        url: currentEntry.url,
+                        sourceUrl: currentEntry.sourceUrl,
+                        previewUrl: currentEntry.previewUrl,
+                        createdAt: currentEntry.createdAt,
+                        title: titleInput.value,
+                        folder: folderInput.value,
+                        tags: tagsInput.value
+                    });
+                    if (result?.entry) {
+                        selectedId = result.entry.id;
+                        refreshPicker(`Updated ${result.entry.title || "GIF"}`);
+                    }
+                }),
+                this.createButton("Copy URL", "ghost", async () => {
+                    const copied = await this.copyText(currentEntry.url);
+                    if (copied) refreshPicker("Copied GIF URL");
+                }),
+                this.createButton("Open", "ghost", () => {
+                    window.open(currentEntry.url, "_blank", "noopener,noreferrer");
+                    refreshPicker(`Opened ${currentEntry.title || "GIF"}`);
+                }),
+                this.createButton("Remove", "danger", () => {
+                    this.removeMyGif(currentEntry.id);
+                    selectedId = "";
+                    refreshPicker(`Removed ${currentEntry.title || "GIF"} from My GIFs`);
+                })
+            );
+
+            detailCard.append(titleInput, folderInput, tagsInput, urlLine, actionRow);
+        };
+
+        const renderGrid = currentEntries => {
+            cleanupPickerObserver();
+            grid.replaceChildren();
+
+            if (!currentEntries.length) {
+                const empty = document.createElement("div");
+                empty.className = "bettergifs-empty";
+                empty.textContent = this.myGifs.length
+                    ? "No GIFs match this filter."
+                    : "Your library is empty. Add one or import from stored URLs.";
+                grid.appendChild(empty);
+                return;
+            }
+
+            const visibleEntries = currentEntries.slice(0, pickerRenderCount);
+            pickerObserver = new IntersectionObserver(entries => {
+                for (const intersection of entries) {
+                    const preview = intersection.target;
+                    if (intersection.isIntersecting) this.activatePreview(preview);
+                    else this.deactivatePreview(preview);
+                }
+            }, {
+                root: grid,
+                rootMargin: "180px 0px",
+                threshold: 0.01
+            });
+
+            for (const entry of visibleEntries) {
+                const card = this.createPickerGifCard(entry, {
+                    selected: entry.id === selectedId,
+                    onSelect: () => {
+                        selectedId = entry.id;
+                        refreshPicker();
+                    },
+                    onCopy: async () => {
+                        const copied = await this.copyText(entry.url);
+                        if (copied) refreshPicker("Copied GIF URL");
+                    },
+                    onOpen: () => {
+                        window.open(entry.url, "_blank", "noopener,noreferrer");
+                        refreshPicker(`Opened ${entry.title || "GIF"}`);
+                    },
+                    onRemove: () => {
+                        this.removeMyGif(entry.id);
+                        if (selectedId === entry.id) selectedId = "";
+                        refreshPicker(`Removed ${entry.title || "GIF"} from My GIFs`);
+                    }
+                });
+                grid.appendChild(card);
+                const preview = card.querySelector(".bettergifs-picker-preview");
+                if (preview) pickerObserver.observe(preview);
+            }
+        };
+
+        const refreshPicker = (message = "") => {
+            syncFolderControls();
+            const filtered = getFilteredEntries();
+
+            if (!filtered.some(entry => entry.id === selectedId)) {
+                selectedId = filtered[0]?.id || "";
+            }
+
+            renderGrid(filtered);
+            renderDetails(filtered.find(entry => entry.id === selectedId) || null);
+            statusLine.textContent = message || `${filtered.length} shown of ${this.myGifs.length} saved GIF${this.myGifs.length === 1 ? "" : "s"}`;
+            addCard.classList.toggle("bettergifs-hidden", !addOpen);
+            advancedBody.classList.toggle("bettergifs-hidden", !advancedOpen);
+            advancedToggleLabel.textContent = advancedOpen ? "Hide" : "Show";
+        };
+
+        this.panelRefreshers.add(refreshPicker);
+        root.__betterGifsCleanup = () => {
+            cleanupPickerObserver();
+            this.panelRefreshers.delete(refreshPicker);
+        };
+
+        const addToggleButton = this.createButton("Add GIF", "primary", () => {
+            addOpen = !addOpen;
+            refreshPicker();
+        });
+        const advancedToggleButton = this.createButton("Advanced", "ghost", () => {
+            advancedOpen = !advancedOpen;
+            refreshPicker();
+        });
+        const closeButton = this.createButton("Close", "ghost", () => this.closeModal());
+        topActions.append(addToggleButton, advancedToggleButton, closeButton);
+        topbar.append(titleWrap, topActions);
+
+        addActions.append(
+            this.createButton("Save", "primary", () => {
+                const result = this.upsertMyGif({
+                    url: addUrlInput.value,
+                    title: addNameInput.value,
+                    folder: addFolderInput.value,
+                    tags: addTagsInput.value
+                });
+                if (!result) {
+                    refreshPicker("Enter a valid media URL");
+                    return;
+                }
+                selectedId = result.entry.id;
+                addUrlInput.value = "";
+                addNameInput.value = "";
+                addTagsInput.value = "";
+                addOpen = false;
+                refreshPicker(`${result.created ? "Added" : "Updated"} ${result.entry.title || "GIF"}`);
+            }),
+            this.createButton("Cancel", "ghost", () => {
+                addOpen = false;
+                refreshPicker();
+            })
+        );
+
+        advancedHead.addEventListener("click", () => {
+            advancedOpen = !advancedOpen;
+            refreshPicker();
+        });
+
+        advancedRow1.append(
+            this.createButton("Import stored URLs", "success", async () => {
+                refreshPicker("Checking stored URLs before import...");
+                const result = await this.importMediaUrlsToMyGifs({ folder: addFolderInput.value, tags: addTagsInput.value });
+                if (result.added) refreshPicker(`Imported ${result.added} stored URL${result.added === 1 ? "" : "s"}${result.skipped ? `, skipped ${result.skipped}` : ""}`);
+                else refreshPicker(result.skipped ? `Skipped ${result.skipped} unavailable stored URL${result.skipped === 1 ? "" : "s"}` : "No new stored URLs to import");
+            }),
+            this.createButton("Export My GIFs", "ghost", async () => {
+                refreshPicker("Checking My GIFs availability...");
+                const result = await this.exportMyGifs();
+                if (result?.exported) refreshPicker(`Exported ${result.exported} My GIF${result.exported === 1 ? "" : "s"}${result.skipped ? `, skipped ${result.skipped}` : ""}`);
+                else if (result?.skipped) refreshPicker(`Skipped ${result.skipped} unavailable GIF${result.skipped === 1 ? "" : "s"} and exported none`);
+            }),
+            this.createButton("Clear My GIFs", "danger", () => {
+                this.myGifs = [];
+                this.saveMyGifs();
+                selectedId = "";
+                refreshPicker("Cleared My GIFs");
+            })
+        );
+
+        advancedRow2.append(
+            this.createButton("Capture favourites", "primary", () => {
+                const added = this.captureFavoritesFromDom({ source: "favourites-dom-manual", notify: true });
+                refreshPicker(added ? `Captured ${added} favourite URL${added === 1 ? "" : "s"}` : "No new favourite URLs found");
+            }),
+            this.createButton("Capture all favourites", "primary", async () => {
+                if (this.favoriteCrawlRunning) {
+                    refreshPicker("Already scanning the full favourites list");
+                    return;
+                }
+                refreshPicker("Scanning the full favourites list...");
+                const result = await this.captureAllFavorites(message => refreshPicker(message));
+                if (!result) refreshPicker("Open the GIF Favourites tab first");
+                else refreshPicker(`Full scan complete: saw ${result.seen} item${result.seen === 1 ? "" : "s"}, added ${result.added} new URL${result.added === 1 ? "" : "s"}`);
+            }),
+            this.createButton("Process input", "warn", async () => {
+                persistAdvancedTextarea();
+                const added = await this.processInput(advancedText.value);
+                refreshPicker(added ? `Added ${added} new URL${added === 1 ? "" : "s"}` : "No new media URLs found");
+            }),
+            this.createButton("Load file", "ghost", () => hiddenFileInput.click())
+        );
+
+        advancedRow3.append(
+            this.createButton("Process saved text", "ghost", async () => {
+                const added = await this.processInput(this.settings.base64Data || "");
+                refreshPicker(added ? `Added ${added} new URL${added === 1 ? "" : "s"}` : "No new media URLs found");
+            }),
+            this.createButton("Process last proto capture", "warn", async () => {
+                if (!this.captureState.lastPayloadText) {
+                    refreshPicker("No /settings-proto/2 payload captured yet");
+                    return;
+                }
+                const added = await this.processCapturedPayload();
+                refreshPicker(added ? `Added ${added} new URL${added === 1 ? "" : "s"} from /settings-proto/2` : "No new media URLs found in last /settings-proto/2 capture");
+            }),
+            this.createButton("Save last proto capture", "ghost", () => {
+                if (!this.captureState.lastPayloadText) {
+                    refreshPicker("No /settings-proto/2 payload captured yet");
+                    return;
+                }
+                this.saveRawCapture();
+                refreshPicker("Saved last /settings-proto/2 payload");
+            }),
+            this.createButton("Clear saved text", "ghost", () => {
+                advancedText.value = "";
+                this.settings.base64Data = "";
+                this.saveSettings();
+                refreshPicker("Cleared saved text");
+            }),
+            this.createButton("Clear stored URLs", "danger", () => {
+                this.mediaUrls = [];
+                this.saveMediaUrls();
+                refreshPicker("Cleared stored URLs");
+            })
+        );
+
+        searchInput.addEventListener("input", () => {
+            pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+            refreshPicker();
+        });
+        folderSelect.addEventListener("change", () => {
+            pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+            refreshPicker();
+        });
+        tagInput.addEventListener("input", () => {
+            pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+            refreshPicker();
+        });
+        grid.addEventListener("scroll", () => {
+            const nearBottom = grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 240;
+            if (!nearBottom) return;
+            const filteredCount = getFilteredEntries().length;
+            if (pickerRenderCount >= filteredCount) return;
+            pickerRenderCount = Math.min(filteredCount, pickerRenderCount + MYGIF_LIBRARY_PAGE_SIZE);
+            renderGrid(getFilteredEntries());
+        });
+
+        main.append(topbar, toolbar, folderChips, addCard, grid, statusLine);
+        side.append(detailCard, advancedCard);
+        shell.append(main, side);
+        root.append(shell);
+
+        refreshPicker();
+        return root;
     }
 
-    // ### Media URL Management
+    createStatCard(label, value) {
+        const card = document.createElement("div");
+        card.className = "bettergifs-card";
+        const strong = document.createElement("strong");
+        strong.textContent = String(value);
+        const name = document.createElement("span");
+        name.textContent = label;
+        card.append(strong, name);
+        return card;
+    }
 
-    async loadMediaUrls() {
+    createButton(label, kind, onClick) {
+        const button = document.createElement("button");
+        button.className = `bettergifs-btn ${kind}`;
+        button.textContent = label;
+        button.addEventListener("click", onClick);
+        return button;
+    }
+
+    createMiniButton(label, onClick) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "bettergifs-mini-btn";
+        button.textContent = label;
+        button.addEventListener("click", event => {
+            event.stopPropagation();
+            onClick?.(event);
+        });
+        return button;
+    }
+
+    createPickerGifCard(entry, actions = {}) {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = `bettergifs-picker-card${actions.selected ? " active" : ""}`;
+        card.addEventListener("click", () => actions.onSelect?.(entry));
+
+        const previewCandidates = this.getAvailabilityCandidates(entry);
+        const previewTag = previewCandidates.some(url => this.isVideoCandidate(url)) ? "video" : "img";
+        const preview = document.createElement(previewTag);
+        preview.className = "bettergifs-picker-preview";
+        if (previewTag === "video") {
+            preview.muted = true;
+            preview.loop = true;
+            preview.autoplay = true;
+            preview.playsInline = true;
+            preview.preload = "metadata";
+        } else {
+            preview.alt = entry.title || "Saved GIF";
+            preview.loading = "lazy";
+        }
+        preview.__betterGifsEntryId = entry.id;
+        preview.__betterGifsCandidates = previewCandidates;
+        preview.addEventListener("loadeddata", () => card.classList.add("ready"), { once: true });
+        preview.addEventListener("load", () => card.classList.add("ready"), { once: true });
+
+        const skeleton = document.createElement("div");
+        skeleton.className = "bettergifs-picker-skeleton";
+
+        const overlay = document.createElement("div");
+        overlay.className = "bettergifs-picker-overlay";
+
+        const label = document.createElement("div");
+        label.className = "bettergifs-picker-label";
+        const name = document.createElement("div");
+        name.className = "bettergifs-picker-name";
+        name.textContent = entry.title || this.inferTitleFromUrl(entry.url);
+        const meta = document.createElement("div");
+        meta.className = "bettergifs-picker-meta";
+        meta.textContent = entry.folder || (entry.tags[0] || this.getExtension(entry.url).toUpperCase());
+        label.append(name, meta);
+
+        const quick = document.createElement("div");
+        quick.className = "bettergifs-picker-quick";
+        quick.append(
+            this.createMiniButton("Copy", () => actions.onCopy?.(entry)),
+            this.createMiniButton("Open", () => actions.onOpen?.(entry)),
+            this.createMiniButton("Remove", () => actions.onRemove?.(entry))
+        );
+
+        overlay.append(label, quick);
+        card.append(preview, skeleton, overlay);
+        return card;
+    }
+
+    revokePreviewCache() {
+        for (const objectUrl of this.previewObjectUrls.values()) {
+            try {
+                URL.revokeObjectURL(objectUrl);
+            } catch {}
+        }
+        this.previewObjectUrls.clear();
+        this.previewLoads.clear();
+    }
+
+    activatePreview(element) {
+        if (!element || element.__betterGifsActive) return;
+
+        element.__betterGifsActive = true;
+        element.__betterGifsIndex = 0;
+        if (!element.__betterGifsOnError) {
+            element.__betterGifsOnError = () => {
+                if (!element.__betterGifsActive) return;
+                if (this.isDiscordAttachmentUrl(element.__betterGifsCurrentCandidate || "")) {
+                    this.removeMyGifOn404(element.__betterGifsEntryId);
+                }
+                element.__betterGifsIndex += 1;
+                this.tryPreviewCandidate(element);
+            };
+            element.addEventListener("error", element.__betterGifsOnError);
+        }
+
+        this.tryPreviewCandidate(element);
+    }
+
+    deactivatePreview(element) {
+        if (!element) return;
+        element.__betterGifsActive = false;
+        element.__betterGifsIndex = 0;
+        if (element.tagName === "VIDEO") {
+            try {
+                element.pause();
+                element.removeAttribute("src");
+                element.load();
+            } catch {}
+        } else {
+            element.removeAttribute("src");
+        }
+    }
+
+    tryPreviewCandidate(element) {
+        const candidates = element?.__betterGifsCandidates || [];
+        const index = element?.__betterGifsIndex || 0;
+        if (!element?.__betterGifsActive || index >= candidates.length) return;
+
+        const candidate = candidates[index];
+        element.__betterGifsCurrentCandidate = candidate;
+        this.setMediaElementSource(element, candidate);
+        this.cachePreviewCandidate(element.__betterGifsEntryId, candidate).then(objectUrl => {
+            if (!element.isConnected || !element.__betterGifsActive) return;
+            if (objectUrl) this.setMediaElementSource(element, objectUrl);
+        }).catch(() => {});
+    }
+
+    setMediaElementSource(element, source) {
+        if (!source) return;
+        element.src = source;
+        if (element.tagName === "VIDEO") {
+            try {
+                element.load();
+                const promise = element.play?.();
+                if (promise?.catch) promise.catch(() => {});
+            } catch {}
+        }
+    }
+
+    async cachePreviewCandidate(entryId, sourceUrl) {
+        const cacheKey = `${entryId}:${sourceUrl}`;
+        if (!this.isDiscordAttachmentUrl(sourceUrl) && this.previewObjectUrls.has(cacheKey)) {
+            const objectUrl = this.previewObjectUrls.get(cacheKey);
+            this.previewObjectUrls.delete(cacheKey);
+            this.previewObjectUrls.set(cacheKey, objectUrl);
+            return objectUrl;
+        }
+        if (this.previewLoads.has(cacheKey)) return this.previewLoads.get(cacheKey);
+
+        const load = fetch(sourceUrl, {
+            credentials: "omit",
+            cache: this.isDiscordAttachmentUrl(sourceUrl) ? "no-store" : "force-cache"
+        }).then(async response => {
+            if (response.status === 404) this.removeMyGifOn404(entryId);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            if (await this.responseContainsUnavailableText(response)) throw new Error("Unavailable content");
+            if (!this.isUsableMediaResponse(response, sourceUrl)) throw new Error("Not media");
+            return response.blob();
+        }).then(blob => {
+            const objectUrl = URL.createObjectURL(blob);
+            this.previewObjectUrls.set(cacheKey, objectUrl);
+            this.prunePreviewCache();
+            return objectUrl;
+        }).finally(() => {
+            this.previewLoads.delete(cacheKey);
+        });
+
+        this.previewLoads.set(cacheKey, load);
+        return load;
+    }
+
+    getPreviewCandidates(entry) {
+        const candidates = [
+            ...(entry?.previewUrl ? [entry.previewUrl] : []),
+            ...(entry?.url ? [entry.url] : []),
+            ...(entry?.sourceUrl ? this.extractEmbeddedUrls(entry.sourceUrl) : [])
+        ];
+        return [...new Set(candidates.map(url => this.resolvePreferredMediaUrl(url)).filter(Boolean))];
+    }
+
+    getAvailabilityCandidates(entry) {
+        const canonicalCandidates = [
+            ...(entry?.url ? [this.resolvePreferredMediaUrl(entry.url) || this.normalizeUrl(entry.url)] : []),
+            ...(entry?.previewUrl ? [this.resolvePreferredMediaUrl(entry.previewUrl) || this.normalizeUrl(entry.previewUrl)] : [])
+        ].filter(Boolean);
+
+        const canonicalDiscordUrl = canonicalCandidates.find(url => this.isDiscordAttachmentUrl(url));
+        if (canonicalDiscordUrl) return [canonicalDiscordUrl];
+
+        return this.getPreviewCandidates(entry);
+    }
+
+    extractEmbeddedUrls(text) {
+        const found = [];
+        for (const variant of this.expandTextVariants(String(text || ""))) {
+            const starts = [...variant.matchAll(/https:\/\//gi)].map(match => match.index);
+            if (!starts.length) continue;
+
+            for (let i = 0; i < starts.length; i += 1) {
+                const start = starts[i];
+                const end = i + 1 < starts.length ? starts[i + 1] : variant.length;
+                const segment = this.trimProtoUrlSegment(variant.slice(start, end));
+                if (segment) found.push(segment);
+            }
+        }
+        return [...new Set(found)];
+    }
+
+    trimProtoUrlSegment(segment) {
+        if (!segment) return "";
+        let value = segment.trim().replace(/[)\]}>,]+$/, "");
+        value = value.split(/[\u0000-\u001f]/, 1)[0];
+
+        const encodedControl = value.match(/%(?:0[0-9a-f]|1[0-9a-f])/i);
+        if (encodedControl?.index >= 0) {
+            value = value.slice(0, encodedControl.index);
+        }
+
+        return value.replace(/[.,;:]+$/, "");
+    }
+
+    resolvePreferredMediaUrl(input) {
+        const candidates = this.extractEmbeddedUrls(input);
+        if (!candidates.length && typeof input === "string" && input.startsWith("https://")) {
+            candidates.push(this.trimProtoUrlSegment(input));
+        }
+        if (!candidates.length) return "";
+
+        const ranked = candidates
+            .map(url => this.basicNormalizeUrl(url))
+            .filter(Boolean)
+            .sort((a, b) => this.scoreMediaCandidate(b) - this.scoreMediaCandidate(a));
+
+        return ranked[0] || "";
+    }
+
+    scoreMediaCandidate(url) {
         try {
-            const urls = BdApi.Data.load("InfiniteGifs", "media_urls");
-            if (Array.isArray(urls)) {
-                this.mediaUrls = urls.filter(url => this.isValidUrl(url));
-                this.log(`Loaded ${this.mediaUrls.length} valid URLs from storage`);
-            }
-        } catch (error) {
-            this.logError("Failed to load URLs from storage", error);
+            const parsed = new URL(url);
+            const host = parsed.hostname.toLowerCase();
+            const pathAndQuery = `${parsed.pathname}${parsed.search}`;
+            let score = 0;
+
+            if (MEDIA_EXT_RE.test(pathAndQuery)) score += 100;
+            if (/^(media\.tenor\.com|media\d*\.giphy\.com|i\.giphy\.com|gif\.fxtwitter\.com)$/i.test(host)) score += 90;
+            if (/^(cdn|media)\.discordapp\.(?:com|net)$/i.test(host)) score += 80;
+            if (/^images-ext-\d+\.discordapp\.net$/i.test(host)) score += 60;
+            if (host === "tenor.com" || host === "giphy.com") score -= 40;
+            if (/\/(?:view|embed)\//i.test(parsed.pathname)) score -= 20;
+
+            return score;
+        } catch {
+            return -Infinity;
         }
     }
 
-    async saveMediaUrls() {
+    basicNormalizeUrl(url) {
         try {
-            BdApi.Data.save("InfiniteGifs", "media_urls", this.mediaUrls);
-            this.log(`Saved ${this.mediaUrls.length} URLs to storage`);
-        } catch (error) {
-            this.logError("Failed to save URLs to storage", error);
+            const parsed = new URL(url);
+            for (const key of ["ex", "is", "hm", "width", "height", "format", "name"]) {
+                parsed.searchParams.delete(key);
+            }
+            const sorted = [...parsed.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b));
+            parsed.search = new URLSearchParams(sorted).toString();
+            return parsed.toString();
+        } catch {
+            return "";
         }
     }
 
-    getRandomMediaUrl() {
-        if (this.mediaUrls.length === 0) {
-            return null;
-        }
-        const randomIndex = Math.floor(Math.random() * this.mediaUrls.length);
-        return this.mediaUrls[randomIndex];
-    }
+    isVideoCandidate(url) {
+        const ext = this.getExtension(url);
+        if (/^(mp4|webm)$/i.test(ext)) return true;
 
-    isValidUrl(url) {
         try {
-            const urlObj = new URL(url);
-            if (urlObj.protocol !== 'https:') {
-                return false;
-            }
-            const knownMediaDomains = ['cdn.discordapp.com', 'media.discordapp.net', 'tenor.com', 'giphy.com'];
-            if (knownMediaDomains.some(domain => urlObj.hostname.includes(domain))) {
-                return true;
-            }
-            const validExtensions = /\.(gif|mp4|webm|webp|jpg|jpeg|png)(\?.*)?$/i;
-            const hasValidExtension = validExtensions.test(urlObj.pathname) || 
-                                     validExtensions.test(urlObj.pathname + urlObj.search);
-            if (!hasValidExtension) {
-                return false;
-            }
-            const hostname = urlObj.hostname;
-            if (!hostname || hostname.length < 3 || !hostname.includes('.')) {
-                return false;
-            }
-            return true;
-        } catch (error) {
+            const host = new URL(url).hostname.toLowerCase();
+            return /^(media\.tenor\.com|media\d*\.giphy\.com|i\.giphy\.com)$/i.test(host) && !/\.gif(?:$|[?#])/i.test(url);
+        } catch {
             return false;
         }
     }
 
-    // ### Data Processing
-
-    async decodeBase64Data() {
-        const base64Setting = this.findSetting("base64Data");
-        if (!base64Setting?.value && !this.tempBase64Data) {
-            this.log("No base64 data to decode");
-            return;
-        }
-        
-        const dataToProcess = this.tempBase64Data || base64Setting.value;
-        
+    isDiscordAttachmentUrl(url) {
         try {
-            this.showMessage("Processing base64 data...", "info");
-            const decodedData = await this.processBase64InChunks(dataToProcess);
-            await this.extractUrlsFromData(decodedData);
-            this.log("Base64 data decoded successfully");
-            this.showMessage(`Processed successfully! Found ${this.mediaUrls.length} URLs`, "success");
-            this.updateStats();
-        } catch (error) {
-            this.logError("Failed to decode base64 data", error);
-            this.showMessage("Failed to decode base64 data", "error");
+            const parsed = new URL(url);
+            if (!DISCORD_MEDIA_RE.test(parsed.hostname)) return false;
+            return /^\/(?:attachments|stickers)\//i.test(parsed.pathname);
+        } catch {
+            return false;
         }
     }
 
-    async processBase64InChunks(base64Data) {
-        if (base64Data.length > this.maxBase64Size) {
-            throw new Error("Base64 data exceeds 100MB limit");
-        }
-        try {
-            const cleanedData = base64Data.replace(/[^A-Za-z0-9+/=]/g, '');
-            const paddingNeeded = (4 - (cleanedData.length % 4)) % 4;
-            const paddedData = cleanedData + '='.repeat(paddingNeeded);
-            const decoded = atob(paddedData);
-            return decoded;
-        } catch (error) {
-            this.logError("Failed to decode base64 data", error);
-            throw new Error("Invalid base64 data");
-        }
-    }
+    createMyGifCard(entry, actions = {}) {
+        const card = document.createElement("div");
+        card.className = "bettergifs-library-item";
 
-    async extractUrlsFromData(data) {
-        const patterns = [
-            /https:\/\/[^\s\x00-\x1F<>"'`{}|\\^]*\.(?:gif|mp4|webm|webp|jpg|jpeg|png)(?:\?[^\s\x00-\x1F<>"'`{}|\\^]*)?/gi,
-            /https:\/\/cdn\.discordapp\.com\/attachments\/[^\s<>"'`{}|\\^]*\.(?:gif|mp4|webm|webp|jpg|jpeg|png)/gi,
-            /https:\/\/media\.discordapp\.net\/attachments\/[^\s<>"'`{}|\\^]*\.(?:gif|mp4|webm|webp|jpg|jpeg|png)/gi,
-            /https:\/\/tenor\.com\/view\/[^\s<>"'`{}|\\^]*/gi,
-            /https:\/\/giphy\.com\/gifs\/[^\s<>"'`{}|\\^]*/gi
-        ];
-        
-        const allMatches = new Set();
-        for (const pattern of patterns) {
-            const matches = data.match(pattern) || [];
-            matches.forEach(match => allMatches.add(match));
+        const previewCandidates = this.getAvailabilityCandidates(entry);
+        const previewTag = previewCandidates.some(url => this.isVideoCandidate(url)) ? "video" : "img";
+        const preview = document.createElement(previewTag);
+        preview.className = "bettergifs-library-preview";
+        if (previewTag === "video") {
+            preview.muted = true;
+            preview.loop = true;
+            preview.autoplay = true;
+            preview.playsInline = true;
+            preview.preload = "metadata";
+        } else {
+            preview.alt = entry.title || "Saved GIF";
+            preview.loading = "lazy";
         }
-        const urls = Array.from(allMatches);
-        const validUrls = urls.filter(url => this.isValidUrl(url));
-        const newUrls = [...this.mediaUrls, ...validUrls];
-        this.mediaUrls = await this.removeDuplicateUrls(newUrls);
-        await this.saveMediaUrls();
-        this.log(`Extracted ${validUrls.length} valid URLs, total unique: ${this.mediaUrls.length}`);
-    }
+        preview.__betterGifsEntryId = entry.id;
+        preview.__betterGifsCandidates = previewCandidates;
 
-    async removeDuplicateUrls(urls) {
-        const uniqueUrls = new Set();
-        const result = [];
-        for (const url of urls) {
-            if (!this.isValidUrl(url)) continue;
-            const normalizedUrl = this.normalizeUrl(url);
-            if (!uniqueUrls.has(normalizedUrl)) {
-                uniqueUrls.add(normalizedUrl);
-                result.push(url);
+        const body = document.createElement("div");
+        body.className = "bettergifs-library-body";
+
+        const name = document.createElement("div");
+        name.className = "bettergifs-library-name";
+        name.textContent = entry.title || this.inferTitleFromUrl(entry.url);
+
+        const meta = document.createElement("div");
+        meta.className = "bettergifs-library-meta";
+        meta.textContent = entry.folder ? `Folder: ${entry.folder}` : "No folder";
+
+        const tagRow = document.createElement("div");
+        tagRow.className = "bettergifs-tag-row";
+        if (entry.tags.length) {
+            for (const tag of entry.tags) {
+                const pill = document.createElement("span");
+                pill.className = "bettergifs-tag";
+                pill.textContent = tag;
+                tagRow.appendChild(pill);
             }
         }
-        const duplicatesRemoved = urls.length - result.length;
-        if (duplicatesRemoved > 0) {
-            this.log(`Removed ${duplicatesRemoved} duplicate/invalid URLs`);
-        }
-        return result;
+
+        const actionRow = document.createElement("div");
+        actionRow.className = "bettergifs-row";
+        actionRow.append(
+            this.createButton("Copy URL", "ghost", () => actions.onCopy?.(entry)),
+            this.createButton("Open", "ghost", () => actions.onOpen?.(entry)),
+            this.createButton("Remove", "danger", () => actions.onRemove?.(entry))
+        );
+
+        body.append(name, meta);
+        if (entry.tags.length) body.append(tagRow);
+        body.append(actionRow);
+        card.append(preview, body);
+        return card;
     }
 
-    normalizeUrl(url) {
-        try {
-            const urlObj = new URL(url);
-            const paramsToRemove = ['ex', 'is', 'hm', 'width', 'height', 't', 'timestamp'];
-            paramsToRemove.forEach(param => urlObj.searchParams.delete(param));
-            const sortedParams = new URLSearchParams([...urlObj.searchParams].sort());
-            urlObj.search = sortedParams.toString();
-            return urlObj.toString();
-        } catch (error) {
-            return url;
-        }
-    }
+    openModal() {
+        if (this.modal?.isConnected) return;
 
-    // ### Dependency Loading
-
-    async loadScript(src) {
-        return new Promise((resolve, reject) => {
-            const existingScript = document.querySelector(`script[src="${src}"]`);
-            if (existingScript) {
-                setTimeout(() => {
-                    if (this.verifyLibraryLoaded(src)) {
-                        resolve();
-                    } else {
-                        existingScript.remove();
-                        this.loadScriptInternal(src, resolve, reject);
-                    }
-                }, 100);
-                return;
-            }
-            this.loadScriptInternal(src, resolve, reject);
+        const modal = document.createElement("div");
+        modal.id = MODAL_ID;
+        modal.addEventListener("click", event => {
+            if (event.target === modal) this.closeModal();
         });
+
+        modal.appendChild(this.buildPickerPanel());
+        document.body.appendChild(modal);
+        this.modal = modal;
+        this.scheduleFavoriteScan();
     }
 
-    loadScriptInternal(src, resolve, reject) {
-        const script = document.createElement('script');
-        script.src = src;
-        script.async = true;
-        script.crossOrigin = 'anonymous';
-        
-        const timeout = setTimeout(() => {
-            script.remove();
-            reject(new Error(`Script load timeout: ${src}`));
-        }, 10000);
-        
-        script.onload = () => {
-            clearTimeout(timeout);
-            this.log(`Successfully loaded script: ${src}`);
-            setTimeout(() => resolve(), 100);
+    closeModal() {
+        this.modal?.firstElementChild?.__betterGifsCleanup?.();
+        this.modal?.remove();
+        this.modal = null;
+    }
+
+    normalizeMyGifEntry(entry) {
+        if (!entry?.url || !this.isMediaUrl(entry.url)) return null;
+        const sourceUrl = typeof entry.sourceUrl === "string" && entry.sourceUrl.trim() ? entry.sourceUrl.trim() : entry.url;
+        const url = this.resolvePreferredMediaUrl(entry.url) || this.normalizeUrl(entry.url);
+        const previewUrl = this.resolvePreferredMediaUrl(entry.previewUrl || sourceUrl || url) || url;
+        const title = typeof entry.title === "string" ? entry.title.trim() : "";
+        const folder = typeof entry.folder === "string" ? entry.folder.trim() : "";
+        const tags = this.parseTags(Array.isArray(entry.tags) ? entry.tags.join(",") : entry.tags || "");
+        return {
+            id: typeof entry.id === "string" && entry.id ? entry.id : this.makeId(),
+            url,
+            sourceUrl,
+            previewUrl,
+            title: title || this.inferTitleFromUrl(url),
+            folder,
+            tags,
+            createdAt: Number(entry.createdAt) || Date.now()
         };
-        
-        script.onerror = (error) => {
-            clearTimeout(timeout);
-            script.remove();
-            this.logError(`Failed to load script: ${src}`, error);
-            reject(new Error(`Failed to load: ${src}`));
-        };
-        
-        document.head.appendChild(script);
     }
 
-    verifyLibraryLoaded(src) {
-        if (src.includes('jszip')) return !!window.JSZip;
-        if (src.includes('FileSaver')) return !!window.saveAs;
-        return true;
+    parseTags(input) {
+        return [...new Set(String(input || "")
+            .split(",")
+            .map(tag => tag.trim().toLowerCase())
+            .filter(Boolean))];
     }
 
-    async initializeFileSaver() {
-        if (this.fileSaverLoaded && window.saveAs) return true;
-        
+    makeId() {
+        return `gif_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    inferTitleFromUrl(url) {
         try {
-            await this.loadScript('https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js');
-            await this.delay(100);
-            
-            if (window.saveAs) {
-                this.fileSaverLoaded = true;
-                this.log("FileSaver.js loaded successfully");
-                return true;
-            }
-            throw new Error("FileSaver.js not available after loading");
-        } catch (error) {
-            this.logError("Failed to load FileSaver.js, using fallback", error);
-            this.implementFallbackSaveAs();
-            this.fileSaverLoaded = true;
-            return true;
+            const parsed = new URL(url);
+            return decodeURIComponent(parsed.pathname.split("/").pop() || "Untitled GIF")
+                .replace(/\.[a-z0-9]+$/i, "")
+                .replace(/[_-]+/g, " ")
+                .trim() || "Untitled GIF";
+        } catch {
+            return "Untitled GIF";
         }
     }
 
-    implementFallbackSaveAs() {
-        if (!window.saveAs) {
-            window.saveAs = (blob, filename) => {
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = filename;
-                a.style.display = 'none';
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
+    upsertMyGif(entry) {
+        const normalized = this.normalizeMyGifEntry(entry);
+        if (!normalized) return null;
+
+        const existingIndex = this.myGifs.findIndex(item => item.url === normalized.url);
+        const created = existingIndex === -1;
+        if (created) {
+            this.myGifs = [normalized, ...this.myGifs];
+        } else {
+            this.myGifs[existingIndex] = {
+                ...this.myGifs[existingIndex],
+                ...normalized,
+                id: this.myGifs[existingIndex].id,
+                createdAt: this.myGifs[existingIndex].createdAt
             };
         }
+        this.saveMyGifs();
+        return { created, entry: created ? normalized : this.myGifs[existingIndex] };
     }
 
-    async initializeJSZip() {
-        if (this.jsZipLoaded && window.JSZip) return true;
-        
-        const cdnUrls = [
-            'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
-            'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js',
-            'https://unpkg.com/jszip@3.10.1/dist/jszip.min.js'
-        ];
-        
-        for (const url of cdnUrls) {
+    removeMyGif(id) {
+        const before = this.myGifs.length;
+        this.myGifs = this.myGifs.filter(entry => entry.id !== id);
+        if (this.myGifs.length !== before) this.saveMyGifs();
+        return before - this.myGifs.length;
+    }
+
+    removeMyGifOn404(id) {
+        if (!id || this.deadMyGifIds.has(id)) return 0;
+        this.deadMyGifIds.add(id);
+        for (const [cacheKey, objectUrl] of this.previewObjectUrls.entries()) {
+            if (!cacheKey.startsWith(`${id}:`)) continue;
+            this.previewObjectUrls.delete(cacheKey);
             try {
-                await this.loadScript(url);
-                await this.delay(100);
-                if (window.JSZip) {
-                    this.jsZipLoaded = true;
-                    this.log(`JSZip loaded from: ${url}`);
-                    return true;
-                }
-            } catch (error) {
-                this.log(`Failed to load JSZip from ${url}: ${error.message}`);
-            }
+                URL.revokeObjectURL(objectUrl);
+            } catch {}
         }
-        
-        throw new Error('Unable to load JSZip library from any CDN');
+        const removed = this.removeMyGif(id);
+        if (removed) this.refreshPanels("Removed unavailable GIF from My GIFs");
+        return removed;
     }
 
-    // ### Download Functionality
-
-    async downloadAllMedia(method = 'zip') {
-        if (this.downloadState.isActive) {
-            this.showMessage("Download already in progress", "warning");
-            return;
-        }
-        if (this.mediaUrls.length === 0) {
-            this.showMessage("No media files to download", "error");
-            return;
-        }
-        
-        this.resetDownloadState();
-        this.downloadState.isActive = true;
-        this.downloadState.total = this.mediaUrls.length;
-        
-        try {
-            if (method === 'zip') {
-                await this.downloadAsZip();
-            } else {
-                await this.downloadIndividually();
-            }
-        } catch (error) {
-            this.logError("Download failed", error);
-            this.showMessage(`Download failed: ${error.message}`, "error");
-        } finally {
-            this.downloadState.isActive = false;
-            if (this.progressModal) {
-                this.progressModal.remove();
-                this.progressModal = null;
-            }
-        }
+    getMyGifFolders() {
+        return [...new Set(this.myGifs.map(entry => entry.folder).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     }
 
-    async downloadAsZip() {
-        try {
-            // Initialize libraries with race condition protection
-            const initPromises = [
-                Promise.race([this.initializeJSZip(), new Promise((_, reject) => setTimeout(() => reject(new Error('JSZip load timeout')), 10000))]),
-                Promise.race([this.initializeFileSaver(), new Promise((_, reject) => setTimeout(() => reject(new Error('FileSaver load timeout')), 10000))])
-            ];
-            
-            const [jsZipReady, fileSaverReady] = await Promise.allSettled(initPromises);
-            
-            if (jsZipReady.status !== 'fulfilled' || !jsZipReady.value) {
-                throw new Error('JSZip failed to load');
-            }
-            
-            if (fileSaverReady.status !== 'fulfilled' || !fileSaverReady.value) {
-                this.log('FileSaver failed to load, using fallback');
-            }
-            
-            const zip = new JSZip();
-            const batchSize = Math.min(parseInt(this.getSettingValue("batchSize")) || 3, 5);
-            
-            // Create progress modal
-            this.progressModal = this.createProgressModal();
-            document.body.appendChild(this.progressModal);
-            
-            this.showMessage(`Creating ZIP archive... (${this.mediaUrls.length} files)`, "info");
-            
-            // Process URLs in batches
-            for (let i = 0; i < this.mediaUrls.length; i += batchSize) {
-                if (this.downloadState.cancelled) {
-                    this.showMessage("Download cancelled", "warning");
-                    return;
-                }
-                
-                const batch = this.mediaUrls.slice(i, i + batchSize);
-                const progress = Math.round((i / this.mediaUrls.length) * 100);
-                this.showMessage(`Processing batch ${Math.floor(i/batchSize) + 1}... (${progress}%)`, "info");
-                
-                await this.processBatch(batch, zip, i);
-                this.updateProgressModal();
-                this.updateDownloadProgress();
-                
-                // Smart delay between batches
-                if (i + batchSize < this.mediaUrls.length) {
-                    await this.smartDelay();
-                }
-            }
-            
-            if (!this.downloadState.cancelled) {
-                // Generate and download ZIP
-                this.progressModal.querySelector('.progress-text').textContent = 'Creating ZIP file...';
-                this.showMessage("Generating ZIP file... This may take a moment.", "info");
-                
-                const content = await zip.generateAsync({
-                    type: "blob",
-                    compression: "DEFLATE",
-                    compressionOptions: { level: 6 },
-                    streamFiles: true,
-                    onUpdate: (metadata) => {
-                        if (this.progressModal) {
-                            const percent = metadata.percent.toFixed(0);
-                            this.progressModal.querySelector('.progress-bar-fill').style.width = `${percent}%`;
-                            this.progressModal.querySelector('.progress-text').textContent = 
-                                `Creating ZIP file... ${percent}%`;
-                        }
-                    }
-                });
-                
-                const filename = this.generateZipFilename();
-                if (window.saveAs) {
-                    window.saveAs(content, filename);
-                    this.showMessage(`ZIP created: ${filename} (${this.downloadState.successful} files)`, "success");
-                } else {
-                    this.downloadBlob(content, filename);
-                    this.showMessage(`ZIP created using fallback: ${filename}`, "success");
-                }
-            }
-            
-        } catch (error) {
-            this.logError("ZIP creation failed", error);
-            this.showMessage(`ZIP creation failed: ${error.message}`, "error");
-            await this.exportUrlList();
-        }
-    }
-
-    async processBatch(urls, zip, startIndex, retries = 3) {
-        const promises = urls.map(async (url, index) => {
-            const globalIndex = startIndex + index;
-            const filename = this.generateOptimizedFilename(url, globalIndex);
-            
-            for (let attempt = 0; attempt < retries; attempt++) {
-                try {
-                    const response = await this.fetchWithTimeout(url, 30000);
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                    }
-                    
-                    const blob = await response.blob();
-                    
-                    // Validate blob
-                    if (blob.size === 0) throw new Error('Empty file');
-                    if (blob.size > 50 * 1024 * 1024) throw new Error('File too large (>50MB)');
-                    
-                    const arrayBuffer = await blob.arrayBuffer();
-                    zip.file(filename, arrayBuffer, { compression: "STORE" });
-                    
-                    this.downloadState.successful++;
-                    this.log(`Added to ZIP: ${filename}`);
-                    return;
-                    
-                } catch (error) {
-                    if (attempt === retries - 1) {
-                        this.downloadState.failed++;
-                        this.logError(`Failed to process ${url} after ${retries} attempts`, error);
-                        zip.file(`ERROR_${filename}.txt`, 
-                            `Failed to download: ${url}\nError: ${error.message}\nTime: ${new Date().toISOString()}`
-                        );
-                    } else {
-                        this.log(`Retrying ${url} (attempt ${attempt + 2}/${retries})`);
-                        await this.delay(Math.pow(2, attempt) * 1000);
-                    }
-                } finally {
-                    this.downloadState.current++;
-                }
-            }
+    getFilteredMyGifs({ query = "", folder = "", tagQuery = "" } = {}) {
+        const normalizedQuery = query.trim().toLowerCase();
+        const normalizedTagQuery = tagQuery.trim().toLowerCase();
+        return this.myGifs.filter(entry => {
+            if (folder && entry.folder !== folder) return false;
+            if (normalizedTagQuery && !entry.tags.some(tag => tag.includes(normalizedTagQuery))) return false;
+            if (!normalizedQuery) return true;
+            const haystack = [entry.title, entry.folder, entry.url, ...entry.tags].join(" ").toLowerCase();
+            return haystack.includes(normalizedQuery);
         });
-        
-        await Promise.allSettled(promises);
     }
 
-    async downloadIndividually() {
-        const fileSaverReady = await this.initializeFileSaver();
-        if (!fileSaverReady) {
-            this.showMessage("Download functionality not available - exporting URLs instead", "warning");
-            await this.exportUrlList();
-            return;
-        }
-        
-        const delay = parseInt(this.getSettingValue("downloadDelay")) || 1000;
-        const batchSize = parseInt(this.getSettingValue("batchSize")) || 3;
-        
-        this.showMessage("Starting individual downloads...", "info");
-        
-        for (let i = 0; i < this.mediaUrls.length; i += batchSize) {
-            if (this.downloadState.cancelled) break;
-            
-            const batch = this.mediaUrls.slice(i, i + batchSize);
-            const promises = batch.map(async (url, batchIndex) => {
-                const globalIndex = i + batchIndex;
-                const filename = this.generateOptimizedFilename(url, globalIndex);
-                
-                try {
-                    const response = await this.fetchWithTimeout(url, 30000);
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    async importMediaUrlsToMyGifs({ folder = "", tags = "" } = {}) {
+        let added = 0;
+        let skipped = 0;
+
+        for (const url of this.mediaUrls) {
+            const candidateEntry = this.normalizeMyGifEntry({ url, folder, tags });
+            if (!candidateEntry) {
+                skipped += 1;
+                continue;
+            }
+
+            const candidates = this.getAvailabilityCandidates(candidateEntry);
+            const requiresImportCheck = candidates.some(candidate => this.isDiscordAttachmentUrl(candidate));
+            if (requiresImportCheck) {
+                let ok = false;
+                for (const candidate of candidates) {
+                    if (await this.checkMediaAvailability(candidate)) {
+                        ok = true;
+                        break;
                     }
-                    
-                    const blob = await response.blob();
-                    if (window.saveAs) {
-                        window.saveAs(blob, filename);
-                    } else {
-                        this.downloadBlob(blob, filename);
-                    }
-                    
-                    this.downloadState.successful++;
-                    this.log(`Downloaded: ${filename}`);
-                } catch (error) {
-                    this.downloadState.failed++;
-                    this.logError(`Failed to download ${filename}`, error);
-                } finally {
-                    this.downloadState.current++;
                 }
+
+                if (!ok) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+
+            const result = this.upsertMyGif({ url, folder, tags });
+            if (result?.created) added += 1;
+        }
+        return { added, skipped };
+    }
+
+    async checkMediaAvailability(url, entryId = "") {
+        try {
+            const response = await fetch(url, {
+                credentials: "omit",
+                cache: "no-store"
             });
-            
-            await Promise.allSettled(promises);
-            this.updateDownloadProgress();
-            
-            if (i + batchSize < this.mediaUrls.length) {
-                await this.delay(delay);
-            }
-        }
-        
-        this.showMessage(
-            `Downloads complete! ${this.downloadState.successful} successful, ${this.downloadState.failed} failed`,
-            this.downloadState.successful > 0 ? "success" : "error"
-        );
-    }
+            if (response.status === 404) this.removeMyGifOn404(entryId);
+            if (!response.ok) return false;
+            if (await this.responseContainsUnavailableText(response)) return false;
 
-    async smartDelay() {
-        const baseDelay = parseInt(this.getSettingValue("downloadDelay")) || 1000;
-        const failureRate = this.downloadState.failed / (this.downloadState.current || 1);
-        
-        // Increase delay if many failures (potential rate limiting)
-        let adjustedDelay = baseDelay;
-        if (failureRate > 0.3) {
-            adjustedDelay = baseDelay * 2;
-        } else if (failureRate > 0.5) {
-            adjustedDelay = baseDelay * 3;
-        }
-        
-        // Random jitter to avoid synchronized requests
-        const jitter = Math.random() * 500;
-        const totalDelay = Math.max(adjustedDelay + jitter, 500);
-        
-        this.log(`Smart delay: ${totalDelay.toFixed(0)}ms (failure rate: ${(failureRate * 100).toFixed(1)}%)`);
-        await this.delay(totalDelay);
-    }
-
-    // ### Progress Modal
-
-    createProgressModal() {
-        const modal = document.createElement('div');
-        modal.className = 'infinitegifs-progress-modal';
-        modal.innerHTML = `
-            <div class="progress-container">
-                <h3>📥 Downloading Media Files</h3>
-                <div class="progress-stats">
-                    <span class="progress-current">0</span> / <span class="progress-total">0</span> files
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-bar-fill"></div>
-                </div>
-                <div class="progress-details">
-                    <div>✅ Success: <span class="progress-success">0</span></div>
-                    <div>❌ Failed: <span class="progress-failed">0</span></div>
-                </div>
-                <div class="progress-text">Preparing downloads...</div>
-                <button class="cancel-btn">Cancel</button>
-            </div>
-        `;
-        
-        // Add styles if not already present
-        if (!document.querySelector('#infinitegifs-modal-styles')) {
-            const style = document.createElement('style');
-            style.id = 'infinitegifs-modal-styles';
-            style.textContent = `
-                .infinitegifs-progress-modal {
-                    position: fixed;
-                    top: 50%;
-                    left: 50%;
-                    transform: translate(-50%, -50%);
-                    background: #36393f;
-                    border-radius: 8px;
-                    padding: 20px;
-                    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
-                    z-index: 999999;
-                    min-width: 400px;
-                    color: #dcddde;
-                    font-family: Whitney, "Helvetica Neue", Helvetica, Arial, sans-serif;
-                }
-                .progress-container h3 {
-                    margin: 0 0 15px 0;
-                    color: #fff;
-                    font-size: 18px;
-                    text-align: center;
-                }
-                .progress-stats {
-                    text-align: center;
-                    margin-bottom: 10px;
-                    font-size: 14px;
-                    font-weight: 500;
-                }
-                .progress-bar {
-                    height: 24px;
-                    background: #202225;
-                    border-radius: 12px;
-                    overflow: hidden;
-                    margin-bottom: 15px;
-                }
-                .progress-bar-fill {
-                    height: 100%;
-                    background: linear-gradient(90deg, #5865f2, #7289da);
-                    transition: width 0.3s ease;
-                    width: 0%;
-                }
-                .progress-details {
-                    display: flex;
-                    justify-content: space-around;
-                    margin-bottom: 10px;
-                    font-size: 13px;
-                }
-                .progress-text {
-                    text-align: center;
-                    font-size: 12px;
-                    color: #b9bbbe;
-                    margin: 10px 0;
-                }
-                .cancel-btn {
-                    width: 100%;
-                    padding: 8px;
-                    background: #f04747;
-                    color: white;
-                    border: none;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    font-weight: 500;
-                    transition: opacity 0.2s;
-                }
-                .cancel-btn:hover {
-                    opacity: 0.8;
-                }
-            `;
-            document.head.appendChild(style);
-        }
-        
-        // Add cancel functionality
-        modal.querySelector('.cancel-btn').addEventListener('click', () => {
-            this.downloadState.cancelled = true;
-            modal.remove();
-        });
-        
-        // Set initial values
-        modal.querySelector('.progress-total').textContent = this.mediaUrls.length;
-        
-        return modal;
-    }
-
-    updateProgressModal() {
-        if (!this.progressModal) return;
-        
-        const progress = (this.downloadState.current / this.downloadState.total * 100).toFixed(0);
-        
-        this.progressModal.querySelector('.progress-current').textContent = this.downloadState.current;
-        this.progressModal.querySelector('.progress-success').textContent = this.downloadState.successful;
-        this.progressModal.querySelector('.progress-failed').textContent = this.downloadState.failed;
-        this.progressModal.querySelector('.progress-bar-fill').style.width = `${progress}%`;
-        this.progressModal.querySelector('.progress-text').textContent = 
-            `Processing... ${progress}% complete`;
-    }
-
-    // ### Settings Panel
-
-    getSettingsPanel() {
-        const panel = document.createElement("div");
-        panel.className = "infinite-gifs-settings";
-        panel.style.cssText = `
-            padding: 20px;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #2f3136;
-            color: #dcddde;
-            border-radius: 8px;
-            max-height: 600px;
-            overflow-y: auto;
-        `;
-        this.generateSettingsCategories(panel);
-        this.generateStatsSection(panel);
-        return panel;
-    }
-
-    generateSettingsCategories(panel) {
-        this.settings.forEach(category => {
-            const categoryElement = this.createCategoryElement(category);
-            panel.appendChild(categoryElement);
-        });
-    }
-
-    createCategoryElement(category) {
-        const container = document.createElement("div");
-        container.className = "settings-category";
-        container.style.cssText = `
-            margin-bottom: 25px;
-            padding: 15px;
-            background: #36393f;
-            border-radius: 8px;
-            border: 1px solid #4f545c;
-        `;
-        const title = document.createElement("h2");
-        title.textContent = category.name;
-        title.style.cssText = `
-            margin: 0 0 15px 0;
-            color: #ffffff;
-            font-size: 18px;
-            font-weight: 600;
-        `;
-        container.appendChild(title);
-        category.settings.forEach(setting => {
-            const settingElement = this.createSettingElement(setting);
-            container.appendChild(settingElement);
-        });
-        return container;
-    }
-
-    createSettingElement(setting) {
-        const container = document.createElement("div");
-        container.className = "setting-item";
-        container.style.cssText = `
-            margin-bottom: 20px;
-            padding: 15px;
-            background: #2f3136;
-            border-radius: 6px;
-            border: 1px solid #4f545c;
-        `;
-        const label = document.createElement("label");
-        label.style.cssText = `
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #ffffff;
-        `;
-        label.textContent = setting.name;
-        container.appendChild(label);
-        if (setting.note) {
-            const note = document.createElement("div");
-            note.textContent = setting.note;
-            note.style.cssText = `
-                margin-bottom: 10px;
-                font-size: 13px;
-                color: #b9bbbe;
-                font-style: italic;
-            `;
-            container.appendChild(note);
-        }
-        const inputElement = this.createInputElement(setting);
-        if (inputElement) {
-            container.appendChild(inputElement);
-        }
-        return container;
-    }
-
-    createInputElement(setting) {
-        switch (setting.type) {
-            case "text":
-                return setting.id === "base64Data" 
-                    ? this.createBase64Input(setting)
-                    : this.createTextInput(setting);
-            case "switch":
-                return this.createSwitchInput(setting);
-            default:
-                return null;
+            return this.isUsableMediaResponse(response, url);
+        } catch {
+            return false;
         }
     }
 
-    createBase64Input(setting) {
-        const container = document.createElement("div");
-        const fileInput = document.createElement("input");
-        fileInput.type = "file";
-        fileInput.accept = ".txt,.json";
-        fileInput.style.cssText = `
-            margin-bottom: 10px;
-            padding: 8px;
-            background: #40444b;
-            color: #dcddde;
-            border: 1px solid #4f545c;
-            border-radius: 4px;
-            width: 100%;
-        `;
-        const statusContainer = document.createElement("div");
-        statusContainer.style.cssText = `
-            width: 100%;
-            padding: 15px;
-            background: #40444b;
-            color: #dcddde;
-            border: 1px solid #4f545c;
-            border-radius: 4px;
-            margin-bottom: 10px;
-            min-height: 80px;
-            font-family: 'Courier New', monospace;
-            font-size: 13px;
-        `;
-        const buttonContainer = document.createElement("div");
-        buttonContainer.style.cssText = `
-            display: flex;
-            gap: 10px;
-            margin-bottom: 10px;
-            flex-wrap: wrap;
-        `;
-        const loadButton = this.createButton("Load from File", "#5865f2", () => fileInput.click());
-        const processButton = this.createButton("Process Data", "#43b581", async () => {
-            if (this.tempBase64Data) {
-                this.updateBase64Status("🔄 Processing data...", "#faa61a", statusContainer);
+    async responseContainsUnavailableText(response) {
+        const contentType = (response.headers.get("content-type") || "").toLowerCase();
+        if (!/text\/html|text\/plain/.test(contentType)) return false;
+
+        try {
+            const text = await response.clone().text();
+            return /This content is no longer available\.?/i.test(text);
+        } catch {
+            return false;
+        }
+    }
+
+    isUsableMediaResponse(response, url = "") {
+        const contentType = (response.headers.get("content-type") || "").toLowerCase();
+        const contentLength = Number(response.headers.get("content-length") || 0);
+        if (contentLength === 0) return false;
+        if (contentType) return /^image\/|^video\//.test(contentType);
+        return MEDIA_EXT_RE.test(url);
+    }
+
+    prunePreviewCache() {
+        while (this.previewObjectUrls.size > MYGIF_PREVIEW_CACHE_LIMIT) {
+            const oldestKey = this.previewObjectUrls.keys().next().value;
+            if (!oldestKey) break;
+            const objectUrl = this.previewObjectUrls.get(oldestKey);
+            this.previewObjectUrls.delete(oldestKey);
+            if (objectUrl) {
                 try {
-                    setting.value = this.tempBase64Data;
-                    this.saveSettings();
-                    await this.decodeBase64Data();
-                    this.updateBase64Status("✅ Data processed successfully", "#43b581", statusContainer);
-                    this.updateStats();
-                } catch (error) {
-                    this.logError("Failed to process data", error);
-                    this.updateBase64Status("❌ Processing failed", "#f04747", statusContainer);
-                }
-            } else {
-                this.updateBase64Status("⚠️ No data to process", "#faa61a", statusContainer);
+                    URL.revokeObjectURL(objectUrl);
+                } catch {}
             }
-        });
-        const clearButton = this.createButton("Clear Data", "#f04747", () => {
-            this.tempBase64Data = null;
-            setting.value = "";
-            this.saveSettings();
-            this.mediaUrls = [];
-            this.saveMediaUrls();
-            this.updateBase64Status("🗑️ Data cleared", "#faa61a", statusContainer);
-            this.updateStats();
-        });
-        const statusDiv = document.createElement("div");
-        statusDiv.className = "base64-status";
-        statusDiv.style.cssText = `
-            font-size: 13px;
-            font-weight: 500;
-            margin-top: 10px;
-        `;
-        this.updateBase64Status = (message, color, container) => {
-            statusDiv.textContent = message;
-            statusDiv.style.color = color;
-            if (this.tempBase64Data || setting.value) {
-                const dataSize = this.tempBase64Data ? this.tempBase64Data.length : (setting.value ? setting.value.length : 0);
-                const sizeKB = Math.round(dataSize / 1024);
-                const sizeMB = (dataSize / (1024 * 1024)).toFixed(2);
-                container.innerHTML = `
-                    <div style="color: #43b581; font-weight: bold; margin-bottom: 8px;">📊 Data Information</div>
-                    <div style="margin-bottom: 4px;">📏 Size: ${sizeKB.toLocaleString()} KB (${sizeMB} MB)</div>
-                    <div style="margin-bottom: 4px;">🔢 Characters: ${dataSize.toLocaleString()}</div>
-                    <div style="margin-bottom: 4px;">📸 URLs Found: ${this.mediaUrls.length.toLocaleString()}</div>
-                    <div style="margin-bottom: 4px;">⚡ Status: ${this.tempBase64Data ? 'Loaded (ready to process)' : 'Processed'}</div>
-                    <div style="color: #72767d; font-size: 11px; margin-top: 8px;">
-                        ✨ Large data handled efficiently - UI stays responsive
-                    </div>
-                `;
-            } else {
-                container.innerHTML = `
-                    <div style="color: #72767d; text-align: center; padding: 20px;">
-                        📤 No data loaded yet<br>
-                        <small>Select a file or paste base64 data to begin</small>
-                    </div>
-                `;
-            }
-        };
-        fileInput.addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (file) {
-                this.updateBase64Status("🔄 Loading file...", "#faa61a", statusContainer);
-                try {
-                    const reader = new FileReader();
-                    reader.onload = (event) => {
-                        this.tempBase64Data = event.target.result;
-                        this.updateBase64Status("✅ File loaded successfully", "#43b581", statusContainer);
-                    };
-                    reader.onerror = () => {
-                        this.updateBase64Status("❌ Failed to load file", "#f04747", statusContainer);
-                    };
-                    reader.readAsText(file);
-                } catch (error) {
-                    this.logError("Failed to read file", error);
-                    this.updateBase64Status("❌ Failed to read file", "#f04747", statusContainer);
+        }
+    }
+
+    async getAvailableMyGifs() {
+        const available = [];
+        let skipped = 0;
+
+        for (const entry of this.myGifs) {
+            const candidates = this.getAvailabilityCandidates(entry);
+            let ok = false;
+            for (const candidate of candidates) {
+                if (await this.checkMediaAvailability(candidate, entry.id)) {
+                    ok = true;
+                    break;
                 }
             }
-        });
-        buttonContainer.appendChild(loadButton);
-        buttonContainer.appendChild(processButton);
-        buttonContainer.appendChild(clearButton);
-        container.appendChild(fileInput);
-        container.appendChild(statusContainer);
-        container.appendChild(buttonContainer);
-        container.appendChild(statusDiv);
-        this.updateBase64Status("Ready", "#43b581", statusContainer);
-        return container;
-    }
 
-    createTextInput(setting) {
-        const input = document.createElement("input");
-        input.type = "text";
-        input.value = setting.value || "";
-        input.style.cssText = `
-            width: 100%;
-            padding: 10px;
-            background: #40444b;
-            color: #dcddde;
-            border: 1px solid #4f545c;
-            border-radius: 4px;
-            font-size: 14px;
-        `;
-        input.addEventListener('input', (e) => {
-            setting.value = e.target.value;
-            this.saveSettings();
-        });
-        return input;
-    }
-
-    createSwitchInput(setting) {
-        const container = document.createElement("div");
-        container.style.cssText = `
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        `;
-        const switchContainer = document.createElement("div");
-        switchContainer.style.cssText = `
-            position: relative;
-            width: 44px;
-            height: 24px;
-            background: ${setting.value ? '#43b581' : '#72767d'};
-            border-radius: 12px;
-            cursor: pointer;
-            transition: background 0.2s;
-        `;
-        const switchHandle = document.createElement("div");
-        switchHandle.style.cssText = `
-            position: absolute;
-            top: 2px;
-            left: ${setting.value ? '22px' : '2px'};
-            width: 20px;
-            height: 20px;
-            background: white;
-            border-radius: 50%;
-            transition: left 0.2s;
-        `;
-        switchContainer.appendChild(switchHandle);
-        const label = document.createElement("span");
-        label.textContent = setting.value ? "Enabled" : "Disabled";
-        label.style.cssText = `
-            font-size: 14px;
-            color: ${setting.value ? '#43b581' : '#72767d'};
-            font-weight: 500;
-        `;
-        switchContainer.addEventListener('click', () => {
-            setting.value = !setting.value;
-            switchContainer.style.background = setting.value ? '#43b581' : '#72767d';
-            switchHandle.style.left = setting.value ? '22px' : '2px';
-            label.textContent = setting.value ? "Enabled" : "Disabled";
-            label.style.color = setting.value ? '#43b581' : '#72767d';
-            this.saveSettings();
-        });
-        container.appendChild(switchContainer);
-        container.appendChild(label);
-        return container;
-    }
-
-    createButton(text, color, onClick) {
-        const button = document.createElement("button");
-        button.textContent = text;
-        button.style.cssText = `
-            padding: 8px 16px;
-            background: ${color};
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-weight: 500;
-            font-size: 14px;
-            transition: opacity 0.2s;
-        `;
-        button.addEventListener('mouseenter', () => button.style.opacity = '0.8');
-        button.addEventListener('mouseleave', () => button.style.opacity = '1');
-        button.addEventListener('click', onClick);
-        return button;
-    }
-
-    generateStatsSection(panel) {
-        const statsContainer = document.createElement("div");
-        statsContainer.className = "stats-section";
-        statsContainer.style.cssText = `
-            margin-top: 20px;
-            padding: 20px;
-            background: #36393f;
-            border-radius: 8px;
-            border: 1px solid #4f545c;
-        `;
-        const title = document.createElement("h2");
-        title.textContent = "Statistics & Actions";
-        title.style.cssText = `
-            margin: 0 0 15px 0;
-            color: #ffffff;
-            font-size: 18px;
-            font-weight: 600;
-        `;
-        statsContainer.appendChild(title);
-        const statsGrid = document.createElement("div");
-        statsGrid.className = "stats-grid";
-        statsGrid.style.cssText = `
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        `;
-        this.createStatsCards(statsGrid);
-        const actionsContainer = document.createElement("div");
-        actionsContainer.style.cssText = `
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-top: 15px;
-        `;
-        this.createActionButtons(actionsContainer);
-        statsContainer.appendChild(statsGrid);
-        statsContainer.appendChild(actionsContainer);
-        panel.appendChild(statsContainer);
-        this.statsContainer = statsContainer;
-        this.statsGrid = statsGrid;
-    }
-
-    createStatsCards(container) {
-        const stats = this.calculateStats();
-        Object.entries(stats).forEach(([key, value]) => {
-            const card = document.createElement("div");
-            card.style.cssText = `
-                padding: 15px;
-                background: #2f3136;
-                border-radius: 6px;
-                border: 1px solid #4f545c;
-                text-align: center;
-            `;
-            const valueDiv = document.createElement("div");
-            valueDiv.textContent = value.toLocaleString();
-            valueDiv.style.cssText = `
-                font-size: 24px;
-                font-weight: bold;
-                color: #43b581;
-                margin-bottom: 5px;
-            `;
-            const labelDiv = document.createElement("div");
-            labelDiv.textContent = this.formatStatLabel(key);
-            labelDiv.style.cssText = `
-                font-size: 12px;
-                color: #b9bbbe;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-            `;
-            card.appendChild(valueDiv);
-            card.appendChild(labelDiv);
-            container.appendChild(card);
-        });
-    }
-
-    createActionButtons(container) {
-        const buttons = [
-            { text: "📥 Download as ZIP", color: "#5865f2", action: () => this.downloadAllMedia('zip') },
-            { text: "📄 Export URL List", color: "#43b581", action: () => this.exportUrlList() },
-            { text: "🔄 Refresh Stats", color: "#faa61a", action: () => this.updateStats() },
-            { text: "❌ Cancel Download", color: "#f04747", action: () => this.cancelDownload() }
-        ];
-        buttons.forEach(({ text, color, action }) => {
-            const button = this.createButton(text, color, action);
-            container.appendChild(button);
-        });
-    }
-
-    calculateStats() {
-        const gifCount = this.mediaUrls.filter(url => url.includes('.gif')).length;
-        const mp4Count = this.mediaUrls.filter(url => url.includes('.mp4')).length;
-        const webmCount = this.mediaUrls.filter(url => url.includes('.webm')).length;
-        return {
-            total: this.mediaUrls.length,
-            gif: gifCount,
-            mp4: mp4Count,
-            webm: webmCount,
-            successful: this.downloadState.successful,
-            failed: this.downloadState.failed
-        };
-    }
-
-    formatStatLabel(key) {
-        const labels = {
-            total: "Total URLs",
-            gif: "GIF Files",
-            mp4: "MP4 Files",
-            webm: "WEBM Files",
-            successful: "Downloaded",
-            failed: "Failed"
-        };
-        return labels[key] || key;
-    }
-
-    updateStats() {
-        if (this.statsGrid) {
-            this.statsGrid.innerHTML = '';
-            this.createStatsCards(this.statsGrid);
+            if (ok) available.push(entry);
+            else skipped += 1;
         }
+
+        return { available, skipped };
     }
 
-    updateDownloadProgress() {
-        if (this.downloadState.total > 0) {
-            const progress = (this.downloadState.current / this.downloadState.total * 100).toFixed(1);
-            this.log(`Download progress: ${progress}% (${this.downloadState.current}/${this.downloadState.total})`);
+    async exportMyGifs() {
+        if (!this.myGifs.length) {
+            this.notice("No My GIFs to export", "warning");
+            return { exported: 0, skipped: 0 };
         }
+
+        const { available, skipped } = await this.getAvailableMyGifs();
+        if (!available.length) {
+            this.notice("No available My GIFs to export", "warning");
+            return { exported: 0, skipped };
+        }
+
+        const content = JSON.stringify(available, null, 2);
+        const filename = `InfiniteGifs_MyGifs_${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+        this.saveBlob(new Blob([content], { type: "application/json;charset=utf-8" }), filename);
+        this.notice(`Exported ${available.length} My GIF${available.length === 1 ? "" : "s"}${skipped ? `, skipped ${skipped} unavailable` : ""}`, skipped ? "warning" : "success");
+        return { exported: available.length, skipped };
     }
 
-    // ### Utility Methods
-
-    fetchWithTimeout(url, timeout = 30000) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeout);
-        return fetch(url, {
-            signal: controller.signal,
-            method: 'GET',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'image/gif,image/webp,image/png,image/jpeg,video/mp4,video/webm,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
-            },
-            mode: 'cors',
-            credentials: 'omit'
-        }).finally(() => clearTimeout(timeoutId));
-    }
-
-    downloadBlob(blob, filename) {
+    async copyText(text) {
         try {
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            await navigator.clipboard.writeText(text);
+            return true;
         } catch (error) {
-            this.logError("Failed to download blob", error);
-            throw error;
+            this.logError("Failed to copy text", error);
+            this.notice("Could not copy URL", "error");
+            return false;
         }
     }
 
-    generateOptimizedFilename(url, index) {
-        try {
-            const urlObj = new URL(url);
-            const ext = this.getFileExtension(url);
-            const paddedIndex = String(index + 1).padStart(4, '0');
-            
-            // Extract meaningful part from URL
-            let name = '';
-            
-            if (url.includes('tenor.com')) {
-                name = 'tenor';
-            } else if (url.includes('giphy.com')) {
-                name = 'giphy';
-            } else if (url.includes('discord')) {
-                const match = urlObj.pathname.match(/\/([^\/]+)\.(gif|mp4|webm|png|jpg|jpeg|webp)/i);
-                name = match ? match[1].substring(0, 20) : 'discord';
-            } else {
-                name = urlObj.hostname.split('.')[0].substring(0, 10);
-            }
-            
-            // Clean filename
-            name = name.replace(/[^a-zA-Z0-9-_]/g, '').substring(0, 20) || 'media';
-            
-            return `${paddedIndex}_${name}.${ext}`;
-            
-        } catch (error) {
-            const ext = this.getFileExtension(url);
-            const paddedIndex = String(index + 1).padStart(4, '0');
-            return `${paddedIndex}_media.${ext}`;
+    scheduleFavoriteScan() {
+        clearTimeout(this.favoriteScanTimer);
+        this.favoriteScanTimer = setTimeout(() => {
+            this.captureFavoritesFromDom({ source: "favourites-dom-auto", notify: false });
+            // Keep passive scanning of visible items, but do not auto-scroll the favourites view.
+        }, 150);
+    }
+
+    getFavoritesPanel() {
+        const panel = document.querySelector('#gif-picker-tab-panel[role="tabpanel"]');
+        if (!panel) return null;
+
+        const heading = panel.querySelector("h3");
+        if (!heading) return null;
+
+        const title = heading.textContent?.trim().toLowerCase();
+        return title === "favourites" || title === "favorites" ? panel : null;
+    }
+
+    getFavoritesScroller(panel = this.getFavoritesPanel()) {
+        if (!panel) return null;
+
+        const candidates = [panel, ...panel.querySelectorAll("div")];
+        let best = null;
+
+        for (const node of candidates) {
+            if (!(node instanceof HTMLElement)) continue;
+            if (node.scrollHeight <= node.clientHeight + 20) continue;
+            if (!best || node.scrollHeight > best.scrollHeight) best = node;
         }
+
+        return best;
     }
 
-    generateZipFilename() {
-        const date = new Date().toISOString().slice(0, 10);
-        const time = new Date().toISOString().slice(11, 19).replace(/:/g, '-');
-        return `InfiniteGifs_${date}_${time}.zip`;
-    }
+    captureFavoritesFromDom({ source = "favourites-dom", notify = false } = {}) {
+        const panel = this.getFavoritesPanel();
+        if (!panel) return 0;
 
-    getFileExtension(url) {
-        try {
-            const urlObj = new URL(url);
-            const pathname = urlObj.pathname.toLowerCase();
-            const match = pathname.match(/\.([a-z0-9]+)$/);
-            if (match) {
-                const ext = match[1];
-                // Map common extensions
-                const extMap = {
-                    'jpeg': 'jpg',
-                    'webm': 'webm',
-                    'mp4': 'mp4',
-                    'webp': 'webp',
-                    'gif': 'gif',
-                    'png': 'png',
-                    'jpg': 'jpg'
-                };
-                return extMap[ext] || ext;
-            }
-            
-            // Fallback based on known domains
-            if (url.includes('giphy.com') || url.includes('tenor.com')) {
-                return 'gif';
-            }
-            
-            return 'gif'; // Default fallback
-        } catch (error) {
-            return 'gif';
-        }
-    }
+        const urls = [...panel.querySelectorAll("img[src], video[src], source[src]")]
+            .map(node => node.currentSrc || node.src || node.getAttribute("src") || "")
+            .filter(Boolean)
+            .filter(url => this.isMediaUrl(url))
+            .map(url => this.normalizeUrl(url));
 
-    resetDownloadState() {
-        this.downloadState = {
-            isActive: false,
-            current: 0,
-            total: 0,
-            successful: 0,
-            failed: 0,
-            cancelled: false
+        const uniqueUrls = [...new Set(urls)];
+        const added = this.addUrls(uniqueUrls);
+
+        this.captureState = {
+            ...this.captureState,
+            lastUrl: uniqueUrls[0] || "",
+            lastSource: source,
+            lastAdded: added,
+            lastSize: uniqueUrls.length,
+            lastCaptureAt: Date.now(),
+            lastTotalSeen: uniqueUrls.length
         };
+
+        if (notify && added > 0) {
+            this.notice(`Captured ${added} new favourite URL${added === 1 ? "" : "s"}`, "success");
+        }
+
+        this.refreshPanels();
+        return added;
+    }
+
+    maybeStartAutoFavoriteCrawl() {
+        const panel = this.getFavoritesPanel();
+        if (!panel) {
+            this.lastAutoCrawlPanel = null;
+            return;
+        }
+
+        if (this.favoriteCrawlRunning) return;
+        if (this.lastAutoCrawlPanel === panel) return;
+
+        this.lastAutoCrawlPanel = panel;
+        this.captureAllFavorites(message => this.refreshPanels(message)).catch(error => {
+            this.logError("Automatic favourites crawl failed", error);
+            if (this.lastAutoCrawlPanel === panel) this.lastAutoCrawlPanel = null;
+        });
+    }
+
+    async captureAllFavorites(onProgress = () => {}) {
+        const panel = this.getFavoritesPanel();
+        const scroller = this.getFavoritesScroller(panel);
+        if (!panel || !scroller) return null;
+
+        const token = ++this.favoriteCrawlToken;
+        this.favoriteCrawlRunning = true;
+
+        const startTop = scroller.scrollTop;
+        const startCount = this.mediaUrls.length;
+        let maxSeen = 0;
+        let stagnantPasses = 0;
+        let previousTop = -1;
+
+        try {
+            for (let step = 0; step < 240; step += 1) {
+                if (token !== this.favoriteCrawlToken) return null;
+
+                this.captureFavoritesFromDom({ source: "favourites-dom-crawl", notify: false });
+                maxSeen = Math.max(maxSeen, this.captureState.lastTotalSeen || 0);
+                onProgress(`Scanning favourites... step ${step + 1}`);
+
+                const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4;
+                if (atBottom) {
+                    stagnantPasses += 1;
+                    if (stagnantPasses >= 3) break;
+                } else {
+                    stagnantPasses = 0;
+                }
+
+                previousTop = scroller.scrollTop;
+                scroller.scrollTop = Math.min(scroller.scrollTop + Math.max(200, Math.floor(scroller.clientHeight * 0.85)), scroller.scrollHeight);
+                scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+                await this.delay(250);
+
+                if (scroller.scrollTop === previousTop) {
+                    stagnantPasses += 1;
+                    if (stagnantPasses >= 3) break;
+                }
+            }
+
+            this.captureFavoritesFromDom({ source: "favourites-dom-crawl", notify: false });
+            maxSeen = Math.max(maxSeen, this.captureState.lastTotalSeen || 0);
+            return {
+                seen: maxSeen,
+                added: this.mediaUrls.length - startCount
+            };
+        } finally {
+            scroller.scrollTop = startTop;
+            scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+            this.favoriteCrawlRunning = false;
+            if (!this.getFavoritesPanel()) {
+                this.lastAutoCrawlPanel = null;
+            }
+            this.refreshPanels();
+        }
+    }
+
+    installNetworkInterceptors() {
+        if (!this.originalFetch && typeof window.fetch === "function") {
+            this.originalFetch = window.fetch.bind(window);
+            window.fetch = async (...args) => {
+                const response = await this.originalFetch(...args);
+                this.inspectNetworkResponse("fetch", args[0], response).catch(error => this.logError("Fetch inspection failed", error));
+                return response;
+            };
+        }
+
+        if (!this.originalXHROpen && !this.originalXHRSend && window.XMLHttpRequest?.prototype) {
+            const proto = window.XMLHttpRequest.prototype;
+            this.originalXHROpen = proto.open;
+            this.originalXHRSend = proto.send;
+
+            proto.open = function(method, url, ...rest) {
+                this.__betterGifsUrl = url;
+                return proto.open.__original.call(this, method, url, ...rest);
+            };
+            proto.open.__original = this.originalXHROpen;
+
+            proto.send = function(...args) {
+                this.addEventListener("load", () => {
+                    const plugin = window[`${PLUGIN_ID}_instance`];
+                    plugin?.inspectXhrResponse(this).catch(error => plugin?.logError("XHR inspection failed", error));
+                }, { once: true });
+                return proto.send.__original.apply(this, args);
+            };
+            proto.send.__original = this.originalXHRSend;
+        }
+
+        window[`${PLUGIN_ID}_instance`] = this;
+    }
+
+    uninstallNetworkInterceptors() {
+        if (this.originalFetch) {
+            window.fetch = this.originalFetch;
+            this.originalFetch = null;
+        }
+
+        const proto = window.XMLHttpRequest?.prototype;
+        if (proto && this.originalXHROpen) {
+            proto.open = this.originalXHROpen;
+            this.originalXHROpen = null;
+        }
+        if (proto && this.originalXHRSend) {
+            proto.send = this.originalXHRSend;
+            this.originalXHRSend = null;
+        }
+
+        delete window[`${PLUGIN_ID}_instance`];
+    }
+
+    async inspectNetworkResponse(source, input, response) {
+        const url = typeof input === "string" ? input : input?.url || response?.url || "";
+        if (!this.shouldInspectUrl(url)) return;
+        if (!response?.ok) return;
+
+        const contentLength = Number(response.headers?.get?.("content-length") || 0);
+        if (contentLength && contentLength > 5 * 1024 * 1024) return;
+
+        const clone = response.clone();
+        const buffer = await clone.arrayBuffer();
+        await this.handleCapturedPayload(source, url, buffer);
+    }
+
+    async inspectXhrResponse(xhr) {
+        const url = xhr.__betterGifsUrl || xhr.responseURL || "";
+        if (!this.shouldInspectUrl(url)) return;
+        if (xhr.status < 200 || xhr.status >= 300) return;
+
+        let buffer = null;
+        if (xhr.response instanceof ArrayBuffer) {
+            buffer = xhr.response;
+        } else if (typeof xhr.response === "string") {
+            buffer = new TextEncoder().encode(xhr.response).buffer;
+        } else {
+            try {
+                if (typeof xhr.responseText === "string") {
+                    buffer = new TextEncoder().encode(xhr.responseText).buffer;
+                }
+            } catch {}
+        }
+
+        if (!buffer || buffer.byteLength > 5 * 1024 * 1024) return;
+        await this.handleCapturedPayload("xhr", url, buffer);
+    }
+
+    shouldInspectUrl(url) {
+        try {
+            const parsed = new URL(url, window.location.origin);
+            const host = parsed.hostname.toLowerCase();
+            if (!/discord|discordapp/i.test(host)) return false;
+            return SETTINGS_PROTO_RE.test(`${parsed.pathname}${parsed.search}`);
+        } catch {
+            return false;
+        }
+    }
+
+    async handleCapturedPayload(source, url, buffer) {
+        if (!buffer?.byteLength) return;
+
+        const utf8 = new TextDecoder().decode(buffer);
+        const binary = new TextDecoder("latin1").decode(buffer);
+        const payloadVariants = [...new Set([utf8, binary].filter(Boolean))];
+        const added = this.addUrls(this.extractUrls(payloadVariants));
+        const payloadText = utf8.length >= binary.length ? utf8 : binary;
+
+        this.captureState = {
+            lastUrl: url,
+            lastSource: source,
+            lastAdded: added,
+            lastSize: buffer.byteLength,
+            lastCaptureAt: Date.now(),
+            lastPayloadText: payloadText,
+            lastPayloadVariants: payloadVariants
+        };
+
+        if (added > 0) {
+            this.notice(`Captured ${added} new URL${added === 1 ? "" : "s"} from /settings-proto/2`, "success");
+        }
+
+        this.refreshPanels();
+    }
+
+    refreshPanels(message = "") {
+        for (const refresh of this.panelRefreshers) {
+            try {
+                refresh(message);
+            } catch (error) {
+                this.logError("Panel refresh failed", error);
+            }
+        }
+    }
+
+    formatCaptureStatus() {
+        if (!this.captureState.lastCaptureAt) {
+            return "Open the GIF Favourites tab and the plugin will scan its visible items. /settings-proto/2 capture is optional fallback.";
+        }
+
+        const when = new Date(this.captureState.lastCaptureAt).toLocaleString();
+        if (this.captureState.lastSource.startsWith("favourites-dom")) {
+            const prefix = this.favoriteCrawlRunning ? "Full favourites scan running. " : "";
+            return `${prefix}Last favourites scan: ${when}, saw ${this.captureState.lastTotalSeen} visible item${this.captureState.lastTotalSeen === 1 ? "" : "s"}, added ${this.captureState.lastAdded} new URL${this.captureState.lastAdded === 1 ? "" : "s"}.`;
+        }
+        const sizeKb = (this.captureState.lastSize / 1024).toFixed(1);
+        return `Last /settings-proto/2 capture: ${when}, ${sizeKb} KB, ${this.captureState.lastAdded} new URL${this.captureState.lastAdded === 1 ? "" : "s"}.`;
     }
 
     delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    deepClone(obj) {
-        return JSON.parse(JSON.stringify(obj));
+    saveRawCapture() {
+        const payload = this.captureState.lastPayloadText;
+        if (!payload) {
+            this.notice("No /settings-proto/2 payload available", "warning");
+            return;
+        }
+
+        const filename = `InfiniteGifs_Capture_${new Date(this.captureState.lastCaptureAt || Date.now()).toISOString().replace(/[:.]/g, "-")}.txt`;
+        const variants = this.captureState.lastPayloadVariants?.filter(Boolean) || [];
+        const text = variants.length > 1
+            ? variants.map((variant, index) => `===== Variant ${index + 1} =====\n${variant}`).join("\n\n")
+            : payload;
+        this.saveBlob(new Blob([text], { type: "text/plain;charset=utf-8" }), filename);
+        this.notice("Saved last /settings-proto/2 payload", "success");
     }
 
-    // ### Messaging and Logging
+    async processCapturedPayload() {
+        const variants = this.captureState.lastPayloadVariants?.filter(Boolean) || [];
+        if (!variants.length) {
+            return this.processInput(this.captureState.lastPayloadText || "");
+        }
 
-    showMessage(message, type = "info") {
-        const colors = {
-            info: "#5865f2",
-            success: "#43b581",
-            warning: "#faa61a",
-            error: "#f04747"
-        };
-        const color = colors[type] || colors.info;
-        BdApi.showNotice(message, { type, timeout: 5000 });
-        this.log(`[${type.toUpperCase()}] ${message}`);
+        const textCandidates = [];
+        for (const variant of variants) {
+            const normalizedVariant = this.unwrapSettingsEnvelope(variant);
+            textCandidates.push(normalizedVariant);
+            textCandidates.push(...this.decodeBase64Variants(normalizedVariant));
+        }
+
+        const before = this.mediaUrls.length;
+        this.addUrls(this.extractUrls(textCandidates));
+        const added = this.mediaUrls.length - before;
+        if (added) this.notice(`Added ${added} new media URL${added === 1 ? "" : "s"}`, "success");
+        return added;
+    }
+
+    async processInput(input) {
+        if (!input?.trim()) {
+            this.notice("No input to process", "warning");
+            return 0;
+        }
+
+        const normalizedInput = this.unwrapSettingsEnvelope(input);
+        const before = this.mediaUrls.length;
+        const textCandidates = [normalizedInput];
+        textCandidates.push(...this.decodeBase64Variants(normalizedInput));
+        this.addUrls(this.extractUrls(textCandidates));
+        const added = this.mediaUrls.length - before;
+        if (added) this.notice(`Added ${added} new media URL${added === 1 ? "" : "s"}`, "success");
+        return added;
+    }
+
+    unwrapSettingsEnvelope(input) {
+        const trimmed = input?.trim();
+        if (!trimmed) return input;
+
+        const withoutPrefix = trimmed.replace(/^:\s*(?=\{)/, "");
+        if (!withoutPrefix.startsWith("{")) return input;
+
+        try {
+            const parsed = JSON.parse(withoutPrefix);
+            if (typeof parsed?.settings === "string" && parsed.settings.trim()) {
+                return parsed.settings.trim();
+            }
+        } catch {}
+
+        return withoutPrefix;
+    }
+
+    decodeBase64Variants(input) {
+        const clean = input.replace(/^data:[^,]+,/, "").replace(/\s+/g, "");
+        if (!clean || clean.length % 4 === 1 || /[^A-Za-z0-9+/=]/.test(clean)) return [];
+
+        try {
+            const binary = atob(clean);
+            const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+            const utf8 = new TextDecoder().decode(bytes);
+            return utf8 === binary ? [binary] : [binary, utf8];
+        } catch {
+            return [];
+        }
+    }
+
+    extractUrls(chunks) {
+        const found = new Set();
+        for (const chunk of chunks) {
+            for (const variant of this.expandTextVariants(chunk)) {
+                const matches = variant.match(MEDIA_URL_RE) || [];
+                for (const match of matches) {
+                    const url = match.replace(/[)\]}>,]+$/, "");
+                    if (this.isMediaUrl(url)) {
+                        found.add(this.normalizeUrl(url));
+                    }
+                }
+            }
+        }
+        return [...found];
+    }
+
+    expandTextVariants(text) {
+        const variants = new Set();
+        if (!text) return variants;
+
+        variants.add(text);
+
+        const slashDecoded = text
+            .replace(/\\u002f/gi, "/")
+            .replace(/\\\//g, "/");
+        variants.add(slashDecoded);
+
+        const commonUnicodeDecoded = slashDecoded.replace(/\\u00([0-9a-f]{2})/gi, (_, hex) => {
+            const code = Number.parseInt(hex, 16);
+            return Number.isNaN(code) ? _ : String.fromCharCode(code);
+        });
+        variants.add(commonUnicodeDecoded);
+
+        return [...variants].filter(Boolean);
+    }
+
+    extractMediaFromMessage(message) {
+        const urls = [];
+
+        for (const attachment of message.attachments || []) {
+            if (attachment?.url) urls.push(attachment.url);
+        }
+        for (const embed of message.embeds || []) {
+            if (embed?.image?.url) urls.push(embed.image.url);
+            if (embed?.video?.url) urls.push(embed.video.url);
+            if (embed?.thumbnail?.url) urls.push(embed.thumbnail.url);
+            if (embed?.gifv?.url) urls.push(embed.gifv.url);
+        }
+        if (message.content) {
+            urls.push(...(message.content.match(MEDIA_URL_RE) || []));
+        }
+
+        return [...new Set(urls.filter(url => this.isMediaUrl(url)).map(url => this.normalizeUrl(url)))];
+    }
+
+    addUrls(urls) {
+        const merged = new Set(this.mediaUrls);
+        for (const url of urls) {
+            const resolved = this.resolvePreferredMediaUrl(url) || url;
+            if (this.isMediaUrl(resolved)) merged.add(this.normalizeUrl(resolved));
+        }
+        const before = this.mediaUrls.length;
+        this.mediaUrls = [...merged];
+        this.saveMediaUrls();
+        return this.mediaUrls.length - before;
+    }
+
+    isMediaUrl(url) {
+        try {
+            const resolved = this.resolvePreferredMediaUrl(url) || url;
+            const parsed = new URL(resolved);
+            if (parsed.protocol !== "https:") return false;
+            if (DISCORD_MEDIA_RE.test(parsed.hostname)) return true;
+            if (/^(media\.tenor\.com|media\d*\.giphy\.com|i\.giphy\.com|gif\.fxtwitter\.com)$/i.test(parsed.hostname)) return true;
+            if (KNOWN_MEDIA_HOST_RE.test(parsed.hostname) && MEDIA_EXT_RE.test(`${parsed.pathname}${parsed.search}`)) return true;
+            return MEDIA_EXT_RE.test(`${parsed.pathname}${parsed.search}`);
+        } catch {
+            return false;
+        }
+    }
+
+    normalizeUrl(url) {
+        return this.basicNormalizeUrl(this.resolvePreferredMediaUrl(url) || url) || url;
+    }
+
+    getCounts() {
+        const counts = { total: this.mediaUrls.length, gif: 0, mp4: 0, webm: 0 };
+        for (const url of this.mediaUrls) {
+            const ext = this.getExtension(url);
+            if (ext in counts) counts[ext] += 1;
+        }
+        return counts;
+    }
+
+    getExtension(url) {
+        try {
+            const match = new URL(url).pathname.toLowerCase().match(/\.([a-z0-9]+)$/);
+            if (!match) return "gif";
+            return match[1] === "jpeg" ? "jpg" : match[1];
+        } catch {
+            return "gif";
+        }
+    }
+
+    async downloadUrlsAsZip(urls = this.mediaUrls, onProgress = () => {}) {
+        if (!urls.length) {
+            this.notice("No media URLs to download", "warning");
+            return;
+        }
+
+        try {
+            await this.ensureJsZip();
+        } catch (error) {
+            this.logError("Failed to load JSZip", error);
+            this.notice("Could not load JSZip", "error");
+            return;
+        }
+
+        const zip = new window.JSZip();
+        let added = 0;
+        let failed = 0;
+        this.abortController?.abort();
+        this.abortController = new AbortController();
+
+        for (const [index, url] of urls.entries()) {
+            onProgress(`Downloading ${index + 1}/${urls.length}`);
+            try {
+                const response = await fetch(url, {
+                    signal: this.abortController.signal,
+                    credentials: "omit",
+                    cache: "no-store"
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const blob = await response.blob();
+                zip.file(this.makeFilename(url, index), blob);
+                added += 1;
+            } catch (error) {
+                failed += 1;
+                this.logError(`Failed to fetch ${url}`, error);
+            }
+        }
+
+        if (!added) {
+            onProgress("Nothing could be downloaded");
+            this.notice("No files were downloaded", "error");
+            return;
+        }
+
+        onProgress("Building ZIP...");
+        const blob = await zip.generateAsync({ type: "blob" });
+        this.saveBlob(blob, `InfiniteGifs_${new Date().toISOString().replace(/[:.]/g, "-")}.zip`);
+        onProgress(`ZIP ready: ${added} file${added === 1 ? "" : "s"}${failed ? `, ${failed} failed` : ""}`);
+        this.notice(`ZIP downloaded (${added} ok${failed ? `, ${failed} failed` : ""})`, failed ? "warning" : "success");
+    }
+
+    async ensureJsZip() {
+        if (window.JSZip) return;
+        await new Promise((resolve, reject) => {
+            const existing = document.querySelector(`script[src="${JSZIP_URL}"]`);
+            if (existing) {
+                if (window.JSZip) {
+                    resolve();
+                    return;
+                }
+                existing.addEventListener("load", resolve, { once: true });
+                existing.addEventListener("error", reject, { once: true });
+                return;
+            }
+
+            const script = document.createElement("script");
+            script.src = JSZIP_URL;
+            script.async = true;
+            script.crossOrigin = "anonymous";
+            script.addEventListener("load", resolve, { once: true });
+            script.addEventListener("error", () => reject(new Error("Failed to load JSZip")), { once: true });
+            document.head.appendChild(script);
+        });
+    }
+
+    exportUrlList() {
+        if (!this.mediaUrls.length) {
+            this.notice("No media URLs to export", "warning");
+            return;
+        }
+
+        const content = this.mediaUrls.join("\n");
+        const filename = `InfiniteGifs_URLs_${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+        this.saveBlob(new Blob([content], { type: "text/plain;charset=utf-8" }), filename);
+        this.notice(`Exported ${this.mediaUrls.length} URL${this.mediaUrls.length === 1 ? "" : "s"}`, "success");
+    }
+
+    saveBlob(blob, filename) {
+        const href = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = href;
+        link.download = filename;
+        link.style.display = "none";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(href), 1000);
+    }
+
+    makeFilename(url, index) {
+        const ext = this.getExtension(url);
+        try {
+            const parsed = new URL(url);
+            const base = (parsed.pathname.split("/").pop() || "media")
+                .replace(/\.[a-z0-9]+$/i, "")
+                .replace(/[^a-z0-9_-]/gi, "")
+                .slice(0, 32) || "media";
+            return `${String(index + 1).padStart(4, "0")}_${base}.${ext}`;
+        } catch {
+            return `${String(index + 1).padStart(4, "0")}_media.${ext}`;
+        }
+    }
+
+    notice(message, type = "info") {
+        try {
+            if (BdApi.UI?.showToast) BdApi.UI.showToast(message, { type });
+            else if (BdApi.showToast) BdApi.showToast(message, { type });
+            else if (BdApi.showNotice) BdApi.showNotice(message, { type, timeout: 5000 });
+        } catch {
+            this.log(message);
+        }
     }
 
     log(message) {
@@ -1387,186 +2696,4 @@ class InfiniteGifs {
     logError(message, error) {
         console.error(`[InfiniteGifs] ${message}`, error);
     }
-
-    // ### Context Menu Integration
-
-    addContextMenuItems() {
-        try {
-            // Add context menu for messages with media
-            BdApi.ContextMenu.patch("message", this.patchMessageContextMenu.bind(this));
-            this.log("Context menu patched successfully");
-        } catch (error) {
-            this.logError("Failed to patch context menu", error);
-        }
-    }
-
-    removeContextMenuItems() {
-        try {
-            BdApi.ContextMenu.unpatch("message", this.patchMessageContextMenu);
-        } catch (error) {
-            this.logError("Failed to unpatch context menu", error);
-        }
-    }
-
-    patchMessageContextMenu(tree, props) {
-        if (!props?.message) return tree;
-        
-        const message = props.message;
-        const mediaUrls = this.extractMediaFromMessage(message);
-        
-        if (mediaUrls.length === 0) return tree;
-        
-        const menuItems = [
-            BdApi.ContextMenu.buildItem({
-                label: `Add ${mediaUrls.length} Media to Collection`,
-                action: () => this.addUrlsToCollection(mediaUrls)
-            }),
-            BdApi.ContextMenu.buildItem({
-                label: "Download This Media",
-                action: () => this.downloadMediaUrls(mediaUrls)
-            })
-        ];
-        
-        tree.props.children.push(
-            BdApi.ContextMenu.buildItem({
-                label: "InfiniteGifs",
-                children: menuItems
-            })
-        );
-        
-        return tree;
-    }
-
-    extractMediaFromMessage(message) {
-        const urls = [];
-        
-        // Extract from attachments
-        if (message.attachments) {
-            message.attachments.forEach(attachment => {
-                if (attachment.url && this.isValidUrl(attachment.url)) {
-                    urls.push(attachment.url);
-                }
-            });
-        }
-        
-        // Extract from embeds
-        if (message.embeds) {
-            message.embeds.forEach(embed => {
-                if (embed.image?.url && this.isValidUrl(embed.image.url)) {
-                    urls.push(embed.image.url);
-                }
-                if (embed.video?.url && this.isValidUrl(embed.video.url)) {
-                    urls.push(embed.video.url);
-                }
-                if (embed.thumbnail?.url && this.isValidUrl(embed.thumbnail.url)) {
-                    urls.push(embed.thumbnail.url);
-                }
-            });
-        }
-        
-        // Extract from content
-        if (message.content) {
-            const urlRegex = /https:\/\/[^\s]+\.(?:gif|mp4|webm|webp|jpg|jpeg|png)(?:\?[^\s]*)?/gi;
-            const matches = message.content.match(urlRegex) || [];
-            matches.forEach(url => {
-                if (this.isValidUrl(url)) {
-                    urls.push(url);
-                }
-            });
-        }
-        
-        return [...new Set(urls)]; // Remove duplicates
-    }
-
-    async addUrlsToCollection(urls) {
-        const validUrls = urls.filter(url => this.isValidUrl(url));
-        const initialCount = this.mediaUrls.length;
-        
-        this.mediaUrls = await this.removeDuplicateUrls([...this.mediaUrls, ...validUrls]);
-        await this.saveMediaUrls();
-        
-        const addedCount = this.mediaUrls.length - initialCount;
-        this.showMessage(`Added ${addedCount} new URLs to collection (Total: ${this.mediaUrls.length})`, "success");
-    }
-
-    async downloadMediaUrls(urls) {
-        const tempUrls = this.mediaUrls;
-        this.mediaUrls = urls.filter(url => this.isValidUrl(url));
-        
-        if (this.mediaUrls.length === 0) {
-            this.showMessage("No valid media URLs found", "error");
-            this.mediaUrls = tempUrls;
-            return;
-        }
-        
-        try {
-            await this.downloadAllMedia('zip');
-        } finally {
-            this.mediaUrls = tempUrls;
-        }
-    }
-
-    // ### Export URL List
-
-    generateAdvancedUrlList() {
-        const timestamp = new Date().toISOString();
-        const stats = this.calculateStats();
-        let content = `InfiniteGifs URL Export
-Generated: ${timestamp}
-Total URLs: ${this.mediaUrls.length}
-GIF Files: ${stats.gif}
-MP4 Files: ${stats.mp4}
-WEBM Files: ${stats.webm}
-Other Files: ${stats.total - stats.gif - stats.mp4 - stats.webm}
-
-${'-'.repeat(50)}
-
-URLs:
-`;
-        this.mediaUrls.forEach((url, index) => {
-            const extension = this.getFileExtension(url);
-            const paddedIndex = (index + 1).toString().padStart(4, '0');
-            content += `${paddedIndex}. [${extension.toUpperCase()}] ${url}\n`;
-        });
-        content += `\n${'-'.repeat(50)}\nEnd of export - ${this.mediaUrls.length} URLs total\n`;
-        return content;
-    }
-
-    async exportUrlList() {
-        try {
-            await this.initializeFileSaver();
-            const content = this.generateAdvancedUrlList();
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const filename = `InfiniteGifs_URLs_${timestamp}.txt`;
-            const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-            if (window.saveAs) {
-                window.saveAs(blob, filename);
-                this.showMessage(`Exported ${this.mediaUrls.length} URLs to ${filename}`, "success");
-            } else {
-                this.downloadBlob(blob, filename);
-                this.showMessage(`Exported ${this.mediaUrls.length} URLs to ${filename}`, "success");
-            }
-        } catch (error) {
-            this.logError("Failed to export URLs", error);
-            try {
-                const content = this.generateAdvancedUrlList();
-                await navigator.clipboard.writeText(content);
-                this.showMessage("URLs copied to clipboard (export failed)", "warning");
-            } catch (clipboardError) {
-                this.showMessage("Export failed and clipboard unavailable", "error");
-            }
-        }
-    }
-
-    cancelDownload() {
-        if (this.downloadState.isActive) {
-            this.downloadState.cancelled = true;
-            this.showMessage("Download cancelled", "warning");
-            this.log("Download cancelled by user");
-        }
-    }
-}
-
-// ### Plugin Export (Required by BetterDiscord)
-
-module.exports = InfiniteGifs;
+};
