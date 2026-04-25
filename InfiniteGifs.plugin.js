@@ -2,7 +2,7 @@
  * @name InfiniteGifs
  * @author VWilk
  * @authorId 363358047784927234
- * @version 2.2.0
+ * @version 2.2.2
  * @description Extracts GIF/media URLs from Discord/base64 data, downloads them as a zip, and adds a BetterGifs button to the expression picker.
  * @source https://github.com/VWilk/InfiniteGifsBD
  * @updateUrl https://raw.githubusercontent.com/VWilk/InfiniteGifsBD/main/InfiniteGifs.plugin.js
@@ -20,17 +20,27 @@ const KNOWN_MEDIA_HOST_RE = /(tenor\.com|giphy\.com)$/i;
 const SETTINGS_PROTO_RE = /\/settings-proto\/2(?:[/?#]|$)/i;
 const MYGIF_PREVIEW_CACHE_LIMIT = 80;
 const MYGIF_LIBRARY_PAGE_SIZE = 36;
+const PREVIEW_WARM_COUNT = 8;
+const PREVIEW_CONCURRENCY = 4;
+const PREVIEW_RETRY_COOLDOWN_MS = 15000;
+const AVAILABILITY_PRELOAD_CONCURRENCY = 6;
 const DEFAULTS = {
-    base64Data: ""
+    base64Data: "",
+    hideUnavailable: false
 };
 
 module.exports = class InfiniteGifs {
     constructor() {
-        this.settings = this.loadData("settings", DEFAULTS);
+        this.settings = {
+            ...DEFAULTS,
+            ...(this.loadData("settings", DEFAULTS) || {})
+        };
         this.mediaUrls = this.loadData("media_urls", [])
             .map(url => this.resolvePreferredMediaUrl(url))
             .filter(url => this.isMediaUrl(url));
         this.myGifs = this.loadData("my_gifs", []).map(entry => this.normalizeMyGifEntry(entry)).filter(Boolean);
+        this.myGifHealth = this.loadData("my_gif_health", {});
+        this.pickerBounds = this.loadData("picker_bounds", null);
         this.modal = null;
         this.observer = null;
         this.unpatchContextMenu = null;
@@ -38,14 +48,28 @@ module.exports = class InfiniteGifs {
         this.originalFetch = null;
         this.originalXHROpen = null;
         this.originalXHRSend = null;
+        this.gifMessageActionsModule = null;
+        this.originalGifSendMessage = null;
+        this.originalGifUnderscoreSendMessage = null;
+        this.nativeGifProbeDepth = 0;
+        this.lastObservedNativeGifSend = null;
         this.panelRefreshers = new Set();
+        this.handleModalKeydown = event => {
+            if (event.key === "Escape" && this.modal?.isConnected) this.closeModal();
+        };
         this.favoriteScanTimer = null;
         this.favoriteCrawlRunning = false;
         this.favoriteCrawlToken = 0;
         this.lastAutoCrawlPanel = null;
         this.previewObjectUrls = new Map();
         this.previewLoads = new Map();
-        this.deadMyGifIds = new Set();
+        this.previewPreferredCandidates = new Map();
+        this.previewRetryAfter = new Map();
+        this.availabilityChecks = new Map();
+        this.availabilityPreloadKeys = new Set();
+        this.providerShareUrlCache = new Map();
+        this.previewQueue = [];
+        this.previewActiveLoads = 0;
         this.captureState = {
             lastUrl: "",
             lastSource: "",
@@ -59,11 +83,13 @@ module.exports = class InfiniteGifs {
     }
 
     start() {
+        this.pruneMyGifHealth();
         this.injectStyles();
         this.observeGifPicker();
         this.injectPickerButton();
         this.patchMessageContextMenu();
         this.installNetworkInterceptors();
+        this.installGifSendInspector();
         if (this.settings.base64Data) {
             this.processInput(this.settings.base64Data).catch(error => this.logError("Startup processing failed", error));
         }
@@ -73,6 +99,12 @@ module.exports = class InfiniteGifs {
         this.abortController?.abort();
         this.abortController = null;
         this.revokePreviewCache();
+        this.previewRetryAfter.clear();
+        this.availabilityChecks.clear();
+        this.availabilityPreloadKeys.clear();
+        this.providerShareUrlCache.clear();
+        this.previewQueue = [];
+        this.previewActiveLoads = 0;
         clearTimeout(this.favoriteScanTimer);
         this.favoriteScanTimer = null;
         this.favoriteCrawlRunning = false;
@@ -81,6 +113,7 @@ module.exports = class InfiniteGifs {
         this.unpatchContextMenu?.();
         this.unpatchContextMenu = null;
         this.uninstallNetworkInterceptors();
+        this.uninstallGifSendInspector();
         this.observer?.disconnect();
         this.observer = null;
         this.panelRefreshers.clear();
@@ -122,6 +155,135 @@ module.exports = class InfiniteGifs {
         this.saveData("my_gifs", this.myGifs);
     }
 
+    saveMyGifHealth() {
+        this.saveData("my_gif_health", this.myGifHealth);
+    }
+
+    savePickerBounds(bounds) {
+        this.pickerBounds = bounds;
+        this.saveData("picker_bounds", bounds);
+    }
+
+    getMyGifHealth(id) {
+        return id ? this.myGifHealth[id] || null : null;
+    }
+
+    markMyGifHealth(id, status, reason = "") {
+        if (!id) return;
+        const previous = this.myGifHealth[id];
+        const next = {
+            status,
+            reason,
+            updatedAt: Date.now()
+        };
+        if (
+            previous?.status === next.status &&
+            previous?.reason === next.reason &&
+            previous?.updatedAt === next.updatedAt
+        ) return;
+        this.myGifHealth[id] = next;
+        this.saveMyGifHealth();
+    }
+
+    markMyGifAvailable(id) {
+        if (!id) return;
+        this.previewRetryAfter.delete(id);
+        const previous = this.myGifHealth[id];
+        if (previous?.status === "available" && !previous.reason) return;
+        this.markMyGifHealth(id, "available", "");
+        if (previous?.status === "unavailable") this.refreshPanels("Restored GIF availability");
+    }
+
+    markMyGifUnavailable(id, reason = "") {
+        if (!id) return;
+        this.markMyGifHealth(id, "unavailable", reason);
+        this.clearPreviewCachesForEntry(id);
+    }
+
+    clearPreviewCachesForEntry(id) {
+        if (!id) return;
+        this.previewPreferredCandidates.delete(id);
+        for (const [cacheKey, objectUrl] of this.previewObjectUrls.entries()) {
+            if (!cacheKey.startsWith(`${id}:`)) continue;
+            this.previewObjectUrls.delete(cacheKey);
+            try {
+                URL.revokeObjectURL(objectUrl);
+            } catch {}
+        }
+    }
+
+    pruneMyGifHealth() {
+        const validIds = new Set(this.myGifs.map(entry => entry.id));
+        let changed = false;
+        for (const id of Object.keys(this.myGifHealth)) {
+            if (validIds.has(id)) continue;
+            delete this.myGifHealth[id];
+            changed = true;
+        }
+        if (changed) this.saveMyGifHealth();
+    }
+
+    clearMyGifHealth(status = "") {
+        if (!status) {
+            this.myGifHealth = {};
+            this.previewRetryAfter.clear();
+            this.availabilityPreloadKeys.clear();
+            this.saveMyGifHealth();
+            return;
+        }
+
+        let changed = false;
+        for (const [id, entry] of Object.entries(this.myGifHealth)) {
+            if (entry?.status !== status) continue;
+            delete this.myGifHealth[id];
+            this.previewRetryAfter.delete(id);
+            changed = true;
+        }
+        if (changed) {
+            this.availabilityPreloadKeys.clear();
+            this.saveMyGifHealth();
+        }
+    }
+
+    unwrapDiscordExternalUrl(input) {
+        try {
+            const parsed = new URL(input);
+            if (!/^images-ext-\d+\.discordapp\.net$/i.test(parsed.hostname)) return "";
+            const marker = "/https/";
+            const markerIndex = parsed.pathname.indexOf(marker);
+            if (markerIndex < 0) return "";
+            const tail = parsed.pathname.slice(markerIndex + marker.length);
+            return this.basicNormalizeUrl(`https://${tail}`);
+        } catch {
+            return "";
+        }
+    }
+
+    getDefaultPickerBounds() {
+        const width = Math.min(720, Math.max(560, window.innerWidth - 48));
+        const height = Math.min(560, Math.max(420, window.innerHeight - 132));
+        return {
+            width,
+            height,
+            left: Math.max(12, window.innerWidth - width - 20),
+            top: Math.max(12, window.innerHeight - height - 88)
+        };
+    }
+
+    normalizePickerBounds(bounds) {
+        const fallback = this.getDefaultPickerBounds();
+        const width = Math.min(Math.max(Number(bounds?.width) || fallback.width, 560), Math.max(560, window.innerWidth - 24));
+        const height = Math.min(Math.max(Number(bounds?.height) || fallback.height, 420), Math.max(420, window.innerHeight - 24));
+        const maxLeft = Math.max(12, window.innerWidth - width - 12);
+        const maxTop = Math.max(12, window.innerHeight - height - 12);
+        return {
+            width,
+            height,
+            left: Math.min(Math.max(Number(bounds?.left) || fallback.left, 12), maxLeft),
+            top: Math.min(Math.max(Number(bounds?.top) || fallback.top, 12), maxTop)
+        };
+    }
+
     injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
 
@@ -129,13 +291,16 @@ module.exports = class InfiniteGifs {
             #${MODAL_ID} {
                 position: fixed;
                 inset: 0;
-                background: rgba(0, 0, 0, 0.7);
                 display: flex;
-                align-items: center;
-                justify-content: center;
+                align-items: flex-end;
+                justify-content: flex-end;
+                padding: 16px 20px 88px;
+                box-sizing: border-box;
                 z-index: 10000;
+                pointer-events: none;
             }
             #${MODAL_ID} .bettergifs-panel {
+                pointer-events: auto;
                 width: min(720px, calc(100vw - 32px));
                 max-height: calc(100vh - 32px);
                 overflow: auto;
@@ -295,29 +460,57 @@ module.exports = class InfiniteGifs {
                 padding: 16px 0 4px;
             }
             .bettergifs-picker-panel {
-                width: min(1040px, calc(100vw - 24px));
+                position: fixed;
+                width: 720px;
+                height: 560px;
+                min-width: 560px;
+                min-height: 420px;
+                max-width: calc(100vw - 24px);
                 max-height: calc(100vh - 24px);
-                padding: 14px;
+                padding: 10px;
+                box-sizing: border-box;
+                resize: both;
                 overflow: hidden;
             }
             .bettergifs-picker-shell {
                 display: grid;
-                grid-template-columns: minmax(0, 1fr) 280px;
-                gap: 14px;
-                min-height: 620px;
+                grid-template-columns: minmax(0, 1fr) 220px;
+                gap: 10px;
+                min-height: 440px;
             }
             .bettergifs-picker-main,
             .bettergifs-picker-side {
                 min-width: 0;
+                min-height: 0;
                 display: flex;
                 flex-direction: column;
-                gap: 12px;
+                gap: 10px;
+            }
+            .bettergifs-picker-side {
+                overflow: hidden;
+            }
+            .bettergifs-picker-side-scroll {
+                display: flex;
+                flex: 1 1 auto;
+                min-height: 0;
+                flex-direction: column;
+                gap: 10px;
+                overflow: auto;
+                padding-right: 2px;
             }
             .bettergifs-picker-topbar {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
                 gap: 12px;
+                cursor: move;
+                user-select: none;
+            }
+            .bettergifs-picker-topbar button,
+            .bettergifs-picker-topbar input,
+            .bettergifs-picker-topbar select,
+            .bettergifs-picker-topbar textarea {
+                cursor: auto;
             }
             .bettergifs-picker-heading {
                 font-size: 18px;
@@ -335,7 +528,7 @@ module.exports = class InfiniteGifs {
             }
             .bettergifs-toolbar {
                 display: grid;
-                grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(140px, 0.55fr));
+                grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(140px, 0.55fr)) auto;
                 gap: 8px;
             }
             .bettergifs-chipbar {
@@ -358,12 +551,13 @@ module.exports = class InfiniteGifs {
             }
             .bettergifs-picker-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-                gap: 10px;
+                grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+                gap: 8px;
+                flex: 1 1 auto;
                 overflow: auto;
                 padding-right: 2px;
                 align-content: start;
-                min-height: 320px;
+                min-height: 0;
             }
             .bettergifs-picker-card {
                 position: relative;
@@ -458,6 +652,7 @@ module.exports = class InfiniteGifs {
                 border: 1px solid var(--border-subtle, #3f4147);
                 border-radius: 8px;
                 padding: 12px;
+                flex: 0 0 auto;
             }
             .bettergifs-side-title {
                 font-size: 13px;
@@ -487,6 +682,19 @@ module.exports = class InfiniteGifs {
                 color: var(--text-muted, #b5bac1);
                 font-size: 12px;
             }
+            .bettergifs-toggle {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                color: var(--text-normal, #dbdee1);
+                font-size: 12px;
+            }
+            .bettergifs-toggle input {
+                margin: 0;
+            }
+            .bettergifs-badge-warn {
+                color: #f0b232;
+            }
             .bettergifs-collapse-head {
                 width: 100%;
                 display: flex;
@@ -513,8 +721,12 @@ module.exports = class InfiniteGifs {
                 to { background-position: 220px 0; }
             }
             @media (max-width: 900px) {
+                #${MODAL_ID} {
+                    padding: 8px 8px 72px;
+                }
                 .bettergifs-picker-panel {
-                    width: min(100vw - 16px, 760px);
+                    min-width: min(560px, calc(100vw - 16px));
+                    min-height: min(420px, calc(100vh - 88px));
                 }
                 .bettergifs-picker-shell {
                     grid-template-columns: 1fr;
@@ -666,6 +878,15 @@ module.exports = class InfiniteGifs {
         const libraryFolderFilter = document.createElement("select");
         libraryFolderFilter.className = "bettergifs-select";
 
+        const libraryHideUnavailable = document.createElement("label");
+        libraryHideUnavailable.className = "bettergifs-toggle";
+        const libraryHideUnavailableInput = document.createElement("input");
+        libraryHideUnavailableInput.type = "checkbox";
+        libraryHideUnavailableInput.checked = !!this.settings.hideUnavailable;
+        const libraryHideUnavailableText = document.createElement("span");
+        libraryHideUnavailableText.textContent = "Hide unavailable";
+        libraryHideUnavailable.append(libraryHideUnavailableInput, libraryHideUnavailableText);
+
         const libraryGrid = document.createElement("div");
         libraryGrid.className = "bettergifs-library-grid";
         let libraryRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
@@ -695,7 +916,8 @@ module.exports = class InfiniteGifs {
 
             const filtered = this.getFilteredMyGifs({
                 query: librarySearchInput.value,
-                folder: libraryFolderFilter.value
+                folder: libraryFolderFilter.value,
+                hideUnavailable: libraryHideUnavailableInput.checked
             });
 
             cleanupLibraryObserver();
@@ -721,6 +943,10 @@ module.exports = class InfiniteGifs {
 
                 for (const entry of visibleEntries) {
                     const card = this.createMyGifCard(entry, {
+                        onSend: async () => {
+                            const sent = await this.sendMediaUrl(entry.url);
+                            if (sent) refreshStats(`Sent ${entry.title || "GIF"}`);
+                        },
                         onCopy: async () => {
                             const copied = await this.copyText(entry.url);
                             if (copied) refreshStats("Copied GIF URL");
@@ -738,6 +964,7 @@ module.exports = class InfiniteGifs {
                     const preview = card.querySelector(".bettergifs-library-preview");
                     if (preview) libraryObserver.observe(preview);
                 }
+                this.warmPreviewCandidates(visibleEntries);
             }
         };
 
@@ -890,14 +1117,19 @@ module.exports = class InfiniteGifs {
                     refreshStats(`Skipped ${result.skipped} unavailable GIF${result.skipped === 1 ? "" : "s"} and exported none`);
                 }
             }),
+            this.createButton("Clear unavailable marks", "ghost", () => {
+                this.clearMyGifHealth("unavailable");
+                refreshStats("Cleared unavailable GIF markers");
+            }),
             this.createButton("Clear My GIFs", "danger", () => {
                 this.myGifs = [];
+                this.clearMyGifHealth();
                 this.saveMyGifs();
                 refreshStats("Cleared My GIFs");
             })
         );
 
-        librarySearchRow.append(librarySearchInput, libraryFolderFilter);
+        librarySearchRow.append(librarySearchInput, libraryFolderFilter, libraryHideUnavailable);
 
         librarySearchInput.addEventListener("input", () => {
             libraryRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
@@ -907,13 +1139,20 @@ module.exports = class InfiniteGifs {
             libraryRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
             refreshStats();
         });
+        libraryHideUnavailableInput.addEventListener("change", () => {
+            this.settings.hideUnavailable = libraryHideUnavailableInput.checked;
+            this.saveSettings();
+            libraryRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
+            refreshStats();
+        });
         libraryGrid.addEventListener("scroll", () => {
             const nearBottom = libraryGrid.scrollTop + libraryGrid.clientHeight >= libraryGrid.scrollHeight - 200;
             if (!nearBottom) return;
 
             const filteredCount = this.getFilteredMyGifs({
                 query: librarySearchInput.value,
-                folder: libraryFolderFilter.value
+                folder: libraryFolderFilter.value,
+                hideUnavailable: libraryHideUnavailableInput.checked
             }).length;
             if (libraryRenderCount >= filteredCount) return;
 
@@ -964,6 +1203,9 @@ module.exports = class InfiniteGifs {
         const side = document.createElement("div");
         side.className = "bettergifs-picker-side";
 
+        const sideScroll = document.createElement("div");
+        sideScroll.className = "bettergifs-picker-side-scroll";
+
         const topbar = document.createElement("div");
         topbar.className = "bettergifs-picker-topbar";
 
@@ -993,7 +1235,16 @@ module.exports = class InfiniteGifs {
         tagInput.className = "bettergifs-input";
         tagInput.placeholder = "Filter by tag";
 
-        toolbar.append(searchInput, folderSelect, tagInput);
+        const hideUnavailableToggle = document.createElement("label");
+        hideUnavailableToggle.className = "bettergifs-toggle";
+        const hideUnavailableInput = document.createElement("input");
+        hideUnavailableInput.type = "checkbox";
+        hideUnavailableInput.checked = !!this.settings.hideUnavailable;
+        const hideUnavailableText = document.createElement("span");
+        hideUnavailableText.textContent = "Hide unavailable";
+        hideUnavailableToggle.append(hideUnavailableInput, hideUnavailableText);
+
+        toolbar.append(searchInput, folderSelect, tagInput, hideUnavailableToggle);
 
         const folderChips = document.createElement("div");
         folderChips.className = "bettergifs-chipbar";
@@ -1069,10 +1320,66 @@ module.exports = class InfiniteGifs {
         advancedCard.append(advancedHead, advancedBody);
 
         let selectedId = "";
-        let pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
         let pickerObserver = null;
         let addOpen = false;
         let advancedOpen = false;
+        let pickerRefreshToken = 0;
+        let visibleReadyIds = new Set();
+        let lastPickerMessage = "";
+        let dragState = null;
+        let resizeObserver = null;
+        let resizeSaveTimer = null;
+        let gridPaginationObserver = null;
+        let gridEntries = [];
+        let gridRenderedCount = 0;
+        let pendingGridScrollTop = null;
+        let pendingRenderedCount = MYGIF_LIBRARY_PAGE_SIZE;
+
+        const interactiveDragSelector = "button, input, select, textarea, a, video, img";
+        const applyPickerBounds = bounds => {
+            const nextBounds = this.normalizePickerBounds(bounds);
+            root.style.left = `${nextBounds.left}px`;
+            root.style.top = `${nextBounds.top}px`;
+            root.style.width = `${nextBounds.width}px`;
+            root.style.height = `${nextBounds.height}px`;
+            return nextBounds;
+        };
+        const saveCurrentBounds = () => {
+            this.savePickerBounds(this.normalizePickerBounds({
+                left: root.offsetLeft,
+                top: root.offsetTop,
+                width: root.offsetWidth,
+                height: root.offsetHeight
+            }));
+        };
+        const stopDragging = () => {
+            if (!dragState) return;
+            dragState = null;
+            document.removeEventListener("mousemove", handleDragMove);
+            document.removeEventListener("mouseup", stopDragging);
+            saveCurrentBounds();
+        };
+        const handleDragMove = event => {
+            if (!dragState) return;
+            const nextBounds = this.normalizePickerBounds({
+                left: dragState.left + (event.clientX - dragState.startX),
+                top: dragState.top + (event.clientY - dragState.startY),
+                width: root.offsetWidth,
+                height: root.offsetHeight
+            });
+            root.style.left = `${nextBounds.left}px`;
+            root.style.top = `${nextBounds.top}px`;
+        };
+        const handleWindowResize = () => {
+            applyPickerBounds({
+                left: root.offsetLeft,
+                top: root.offsetTop,
+                width: root.offsetWidth,
+                height: root.offsetHeight
+            });
+            saveCurrentBounds();
+        };
+        applyPickerBounds(this.pickerBounds || this.getDefaultPickerBounds());
 
         const persistAdvancedTextarea = () => {
             this.settings.base64Data = advancedText.value;
@@ -1100,6 +1407,10 @@ module.exports = class InfiniteGifs {
                 pickerObserver.disconnect();
                 pickerObserver = null;
             }
+            if (gridPaginationObserver) {
+                gridPaginationObserver.disconnect();
+                gridPaginationObserver = null;
+            }
             for (const node of grid.querySelectorAll(".bettergifs-picker-preview")) {
                 this.deactivatePreview(node);
             }
@@ -1110,8 +1421,42 @@ module.exports = class InfiniteGifs {
         const getFilteredEntries = () => this.getFilteredMyGifs({
             query: searchInput.value,
             folder: folderSelect.value,
-            tagQuery: tagInput.value
+            tagQuery: tagInput.value,
+            hideUnavailable: hideUnavailableInput.checked
         });
+
+        const updateStatusLine = (message = lastPickerMessage) => {
+            if (message) {
+                statusLine.textContent = message;
+                return;
+            }
+
+            const filtered = getFilteredEntries();
+            const readyCount = Math.min(visibleReadyIds.size, filtered.length);
+            const parts = [
+                `${gridRenderedCount} shown of ${filtered.length} match${filtered.length === 1 ? "" : "es"}`,
+                `${readyCount} preview${readyCount === 1 ? "" : "s"} ready`,
+                `${this.myGifs.length} saved`
+            ];
+            statusLine.textContent = parts.join(" | ");
+        };
+        const setPickerMessage = message => {
+            lastPickerMessage = message;
+            updateStatusLine();
+        };
+        const syncSelectedCardState = () => {
+            for (const card of grid.querySelectorAll(".bettergifs-picker-card")) {
+                card.classList.toggle("active", card.dataset.entryId === selectedId);
+            }
+        };
+        const selectEntry = entry => {
+            if (!entry) return;
+            selectedId = entry.id;
+            syncSelectedCardState();
+            renderDetails(entry);
+            lastPickerMessage = "";
+            updateStatusLine();
+        };
 
         const syncFolderControls = () => {
             const previousFolder = folderSelect.value || "";
@@ -1131,7 +1476,6 @@ module.exports = class InfiniteGifs {
                 chip.textContent = label;
                 chip.addEventListener("click", () => {
                     folderSelect.value = value;
-                    pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
                     refreshPicker();
                 });
                 return chip;
@@ -1176,7 +1520,7 @@ module.exports = class InfiniteGifs {
                 preview.loading = "lazy";
             }
             preview.__betterGifsEntryId = currentEntry.id;
-            preview.__betterGifsCandidates = previewCandidates;
+            preview.__betterGifsCandidates = this.prioritizePreviewCandidates(currentEntry.id, previewCandidates);
             detailCard.appendChild(preview);
             this.activatePreview(preview);
 
@@ -1197,7 +1541,11 @@ module.exports = class InfiniteGifs {
 
             const urlLine = document.createElement("div");
             urlLine.className = "bettergifs-countline";
-            urlLine.textContent = currentEntry.url;
+            const health = this.getMyGifHealth(currentEntry.id);
+            urlLine.textContent = health?.status === "unavailable"
+                ? `${currentEntry.url} | Marked unavailable${health.reason ? ` (${health.reason})` : ""}`
+                : currentEntry.url;
+            if (health?.status === "unavailable") urlLine.classList.add("bettergifs-badge-warn");
 
             const actionRow = document.createElement("div");
             actionRow.className = "bettergifs-row";
@@ -1215,30 +1563,104 @@ module.exports = class InfiniteGifs {
                     });
                     if (result?.entry) {
                         selectedId = result.entry.id;
-                        refreshPicker(`Updated ${result.entry.title || "GIF"}`);
+                        refreshPicker(`Updated ${result.entry.title || "GIF"}`, { preserveScroll: true });
                     }
                 }),
                 this.createButton("Copy URL", "ghost", async () => {
                     const copied = await this.copyText(currentEntry.url);
-                    if (copied) refreshPicker("Copied GIF URL");
+                    if (copied) setPickerMessage("Copied GIF URL");
+                }),
+                this.createButton("Send", "success", async () => {
+                    const sent = await this.sendGifEntry(currentEntry);
+                    if (sent) setPickerMessage(`Sent ${currentEntry.title || "GIF"}`);
                 }),
                 this.createButton("Open", "ghost", () => {
                     window.open(currentEntry.url, "_blank", "noopener,noreferrer");
-                    refreshPicker(`Opened ${currentEntry.title || "GIF"}`);
+                    setPickerMessage(`Opened ${currentEntry.title || "GIF"}`);
                 }),
                 this.createButton("Remove", "danger", () => {
                     this.removeMyGif(currentEntry.id);
                     selectedId = "";
-                    refreshPicker(`Removed ${currentEntry.title || "GIF"} from My GIFs`);
+                    refreshPicker(`Removed ${currentEntry.title || "GIF"} from My GIFs`, { preserveScroll: true });
                 })
             );
 
             detailCard.append(titleInput, folderInput, tagsInput, urlLine, actionRow);
         };
 
+        const appendNextGridBatch = () => {
+            if (!gridEntries.length || gridRenderedCount >= gridEntries.length) return;
+
+            const fragment = document.createDocumentFragment();
+            const nextEntries = gridEntries.slice(gridRenderedCount, gridRenderedCount + MYGIF_LIBRARY_PAGE_SIZE);
+            for (const entry of nextEntries) {
+                const card = this.createPickerGifCard(entry, {
+                    selected: entry.id === selectedId,
+                    onSelect: () => selectEntry(entry),
+                    onCopy: async () => {
+                        const copied = await this.copyText(entry.url);
+                        if (copied) setPickerMessage("Copied GIF URL");
+                    },
+                    onSend: async () => {
+                        const sent = await this.sendGifEntry(entry);
+                        if (sent) setPickerMessage(`Sent ${entry.title || "GIF"}`);
+                    },
+                    onOpen: () => {
+                        window.open(entry.url, "_blank", "noopener,noreferrer");
+                        setPickerMessage(`Opened ${entry.title || "GIF"}`);
+                    },
+                    onRemove: () => {
+                        this.removeMyGif(entry.id);
+                        if (selectedId === entry.id) selectedId = "";
+                        refreshPicker(`Removed ${entry.title || "GIF"} from My GIFs`, { preserveScroll: true });
+                    },
+                    onPreviewReady: currentEntry => {
+                        visibleReadyIds.add(currentEntry.id);
+                        updateStatusLine();
+                    }
+                });
+                fragment.appendChild(card);
+            }
+
+            grid.appendChild(fragment);
+            this.warmPreviewCandidates(nextEntries);
+            for (const preview of grid.querySelectorAll(".bettergifs-picker-preview")) {
+                if (!preview.__betterGifsObserved && pickerObserver) {
+                    preview.__betterGifsObserved = true;
+                    pickerObserver.observe(preview);
+                }
+            }
+
+            gridRenderedCount += nextEntries.length;
+            grid.querySelector(".bettergifs-grid-sentinel")?.remove();
+
+            if (gridRenderedCount < gridEntries.length) {
+                const sentinel = document.createElement("div");
+                sentinel.className = "bettergifs-grid-sentinel";
+                sentinel.setAttribute("aria-hidden", "true");
+                grid.appendChild(sentinel);
+
+                gridPaginationObserver?.disconnect();
+                gridPaginationObserver = new IntersectionObserver(entries => {
+                    if (!entries.some(entry => entry.isIntersecting)) return;
+                    appendNextGridBatch();
+                }, {
+                    root: grid,
+                    rootMargin: "240px 0px",
+                    threshold: 0.01
+                });
+                gridPaginationObserver.observe(sentinel);
+            }
+
+            updateStatusLine();
+        };
+
         const renderGrid = currentEntries => {
             cleanupPickerObserver();
             grid.replaceChildren();
+            visibleReadyIds = new Set();
+            gridEntries = currentEntries;
+            gridRenderedCount = 0;
 
             if (!currentEntries.length) {
                 const empty = document.createElement("div");
@@ -1247,10 +1669,10 @@ module.exports = class InfiniteGifs {
                     ? "No GIFs match this filter."
                     : "Your library is empty. Add one or import from stored URLs.";
                 grid.appendChild(empty);
+                updateStatusLine();
                 return;
             }
 
-            const visibleEntries = currentEntries.slice(0, pickerRenderCount);
             pickerObserver = new IntersectionObserver(entries => {
                 for (const intersection of entries) {
                     const preview = intersection.target;
@@ -1263,35 +1685,41 @@ module.exports = class InfiniteGifs {
                 threshold: 0.01
             });
 
-            for (const entry of visibleEntries) {
-                const card = this.createPickerGifCard(entry, {
-                    selected: entry.id === selectedId,
-                    onSelect: () => {
-                        selectedId = entry.id;
-                        refreshPicker();
-                    },
-                    onCopy: async () => {
-                        const copied = await this.copyText(entry.url);
-                        if (copied) refreshPicker("Copied GIF URL");
-                    },
-                    onOpen: () => {
-                        window.open(entry.url, "_blank", "noopener,noreferrer");
-                        refreshPicker(`Opened ${entry.title || "GIF"}`);
-                    },
-                    onRemove: () => {
-                        this.removeMyGif(entry.id);
-                        if (selectedId === entry.id) selectedId = "";
-                        refreshPicker(`Removed ${entry.title || "GIF"} from My GIFs`);
-                    }
+            const targetRenderedCount = Math.min(Math.max(pendingRenderedCount || MYGIF_LIBRARY_PAGE_SIZE, MYGIF_LIBRARY_PAGE_SIZE), currentEntries.length);
+            while (gridRenderedCount < targetRenderedCount) {
+                appendNextGridBatch();
+            }
+
+            if (pendingGridScrollTop !== null) {
+                const nextScrollTop = pendingGridScrollTop;
+                pendingGridScrollTop = null;
+                requestAnimationFrame(() => {
+                    if (!grid.isConnected) return;
+                    grid.scrollTop = Math.min(nextScrollTop, Math.max(0, grid.scrollHeight - grid.clientHeight));
                 });
-                grid.appendChild(card);
-                const preview = card.querySelector(".bettergifs-picker-preview");
-                if (preview) pickerObserver.observe(preview);
             }
         };
 
-        const refreshPicker = (message = "") => {
+        const refreshPicker = async (message = "", options = {}) => {
+            const refreshToken = ++pickerRefreshToken;
+            if (options.preserveScroll) {
+                pendingGridScrollTop = grid.scrollTop;
+                pendingRenderedCount = Math.max(gridRenderedCount, MYGIF_LIBRARY_PAGE_SIZE);
+            } else {
+                pendingGridScrollTop = null;
+                pendingRenderedCount = MYGIF_LIBRARY_PAGE_SIZE;
+            }
+            lastPickerMessage = message;
             syncFolderControls();
+            statusLine.textContent = message || "Checking GIF availability...";
+            await this.preloadMyGifAvailability(this.myGifs, {
+                query: searchInput.value,
+                folder: folderSelect.value,
+                tagQuery: tagInput.value,
+                hideUnavailable: hideUnavailableInput.checked,
+                force: !!options.forcePreload
+            });
+            if (refreshToken !== pickerRefreshToken || !root.isConnected) return;
             const filtered = getFilteredEntries();
 
             if (!filtered.some(entry => entry.id === selectedId)) {
@@ -1300,15 +1728,22 @@ module.exports = class InfiniteGifs {
 
             renderGrid(filtered);
             renderDetails(filtered.find(entry => entry.id === selectedId) || null);
-            statusLine.textContent = message || `${filtered.length} shown of ${this.myGifs.length} saved GIF${this.myGifs.length === 1 ? "" : "s"}`;
             addCard.classList.toggle("bettergifs-hidden", !addOpen);
             advancedBody.classList.toggle("bettergifs-hidden", !advancedOpen);
             advancedToggleLabel.textContent = advancedOpen ? "Hide" : "Show";
+            syncSelectedCardState();
+            updateStatusLine();
         };
 
         this.panelRefreshers.add(refreshPicker);
         root.__betterGifsCleanup = () => {
+            stopDragging();
             cleanupPickerObserver();
+            clearTimeout(resizeSaveTimer);
+            resizeObserver?.disconnect();
+            resizeObserver = null;
+            window.removeEventListener("resize", handleWindowResize);
+            saveCurrentBounds();
             this.panelRefreshers.delete(refreshPicker);
         };
 
@@ -1367,8 +1802,13 @@ module.exports = class InfiniteGifs {
                 if (result?.exported) refreshPicker(`Exported ${result.exported} My GIF${result.exported === 1 ? "" : "s"}${result.skipped ? `, skipped ${result.skipped}` : ""}`);
                 else if (result?.skipped) refreshPicker(`Skipped ${result.skipped} unavailable GIF${result.skipped === 1 ? "" : "s"} and exported none`);
             }),
+            this.createButton("Clear unavailable marks", "ghost", () => {
+                this.clearMyGifHealth("unavailable");
+                refreshPicker("Cleared unavailable GIF markers", { preserveScroll: true });
+            }),
             this.createButton("Clear My GIFs", "danger", () => {
                 this.myGifs = [];
+                this.clearMyGifHealth();
                 this.saveMyGifs();
                 selectedId = "";
                 refreshPicker("Cleared My GIFs");
@@ -1433,32 +1873,53 @@ module.exports = class InfiniteGifs {
         );
 
         searchInput.addEventListener("input", () => {
-            pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
             refreshPicker();
         });
         folderSelect.addEventListener("change", () => {
-            pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
             refreshPicker();
         });
         tagInput.addEventListener("input", () => {
-            pickerRenderCount = MYGIF_LIBRARY_PAGE_SIZE;
             refreshPicker();
         });
-        grid.addEventListener("scroll", () => {
-            const nearBottom = grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 240;
-            if (!nearBottom) return;
-            const filteredCount = getFilteredEntries().length;
-            if (pickerRenderCount >= filteredCount) return;
-            pickerRenderCount = Math.min(filteredCount, pickerRenderCount + MYGIF_LIBRARY_PAGE_SIZE);
-            renderGrid(getFilteredEntries());
+        hideUnavailableInput.addEventListener("change", () => {
+            this.settings.hideUnavailable = hideUnavailableInput.checked;
+            this.saveSettings();
+            refreshPicker();
         });
+        topbar.addEventListener("mousedown", event => {
+            if (event.button !== 0) return;
+            if (event.target.closest(interactiveDragSelector)) return;
+            dragState = {
+                startX: event.clientX,
+                startY: event.clientY,
+                left: root.offsetLeft,
+                top: root.offsetTop
+            };
+            document.addEventListener("mousemove", handleDragMove);
+            document.addEventListener("mouseup", stopDragging);
+            event.preventDefault();
+        });
+        resizeObserver = new ResizeObserver(() => {
+            const normalized = this.normalizePickerBounds({
+                left: root.offsetLeft,
+                top: root.offsetTop,
+                width: root.offsetWidth,
+                height: root.offsetHeight
+            });
+            this.pickerBounds = normalized;
+            clearTimeout(resizeSaveTimer);
+            resizeSaveTimer = setTimeout(() => this.savePickerBounds(normalized), 120);
+        });
+        resizeObserver.observe(root);
+        window.addEventListener("resize", handleWindowResize);
 
         main.append(topbar, toolbar, folderChips, addCard, grid, statusLine);
-        side.append(detailCard, advancedCard);
+        sideScroll.append(detailCard, advancedCard);
+        side.append(sideScroll);
         shell.append(main, side);
         root.append(shell);
 
-        refreshPicker();
+        refreshPicker("", { forcePreload: true });
         return root;
     }
 
@@ -1497,6 +1958,7 @@ module.exports = class InfiniteGifs {
         const card = document.createElement("button");
         card.type = "button";
         card.className = `bettergifs-picker-card${actions.selected ? " active" : ""}`;
+        card.dataset.entryId = entry.id;
         card.addEventListener("click", () => actions.onSelect?.(entry));
 
         const previewCandidates = this.getAvailabilityCandidates(entry);
@@ -1514,9 +1976,16 @@ module.exports = class InfiniteGifs {
             preview.loading = "lazy";
         }
         preview.__betterGifsEntryId = entry.id;
-        preview.__betterGifsCandidates = previewCandidates;
-        preview.addEventListener("loadeddata", () => card.classList.add("ready"), { once: true });
-        preview.addEventListener("load", () => card.classList.add("ready"), { once: true });
+        preview.__betterGifsCandidates = this.prioritizePreviewCandidates(entry.id, previewCandidates);
+        const markReady = () => {
+            card.classList.add("ready");
+            if (preview.__betterGifsCurrentCandidate) {
+                this.previewPreferredCandidates.set(entry.id, preview.__betterGifsCurrentCandidate);
+            }
+            actions.onPreviewReady?.(entry);
+        };
+        preview.addEventListener("loadeddata", markReady, { once: true });
+        preview.addEventListener("load", markReady, { once: true });
 
         const skeleton = document.createElement("div");
         skeleton.className = "bettergifs-picker-skeleton";
@@ -1531,12 +2000,17 @@ module.exports = class InfiniteGifs {
         name.textContent = entry.title || this.inferTitleFromUrl(entry.url);
         const meta = document.createElement("div");
         meta.className = "bettergifs-picker-meta";
-        meta.textContent = entry.folder || (entry.tags[0] || this.getExtension(entry.url).toUpperCase());
+        const pickerHealth = this.getMyGifHealth(entry.id);
+        meta.textContent = pickerHealth?.status === "unavailable"
+            ? "Unavailable"
+            : (entry.folder || (entry.tags[0] || this.getExtension(entry.url).toUpperCase()));
+        if (pickerHealth?.status === "unavailable") meta.classList.add("bettergifs-badge-warn");
         label.append(name, meta);
 
         const quick = document.createElement("div");
         quick.className = "bettergifs-picker-quick";
         quick.append(
+            this.createMiniButton("Send", () => actions.onSend?.(entry)),
             this.createMiniButton("Copy", () => actions.onCopy?.(entry)),
             this.createMiniButton("Open", () => actions.onOpen?.(entry)),
             this.createMiniButton("Remove", () => actions.onRemove?.(entry))
@@ -1555,26 +2029,72 @@ module.exports = class InfiniteGifs {
         }
         this.previewObjectUrls.clear();
         this.previewLoads.clear();
+        this.previewPreferredCandidates.clear();
+        this.previewRetryAfter.clear();
     }
 
     activatePreview(element) {
         if (!element || element.__betterGifsActive) return;
 
+        const entryId = element.__betterGifsEntryId;
+        const retryAfter = entryId ? (this.previewRetryAfter.get(entryId) || 0) : 0;
+        if (retryAfter > Date.now()) return;
+
         element.__betterGifsActive = true;
         element.__betterGifsIndex = 0;
+        element.__betterGifsFailed = false;
+        if (!element.__betterGifsOnLoad) {
+            element.__betterGifsOnLoad = () => {
+                this.markMyGifAvailable(element.__betterGifsEntryId);
+                element.__betterGifsFailed = false;
+                if (element.__betterGifsCurrentCandidate) {
+                    this.previewPreferredCandidates.set(element.__betterGifsEntryId, element.__betterGifsCurrentCandidate);
+                }
+            };
+            element.addEventListener("load", element.__betterGifsOnLoad);
+            element.addEventListener("loadeddata", element.__betterGifsOnLoad);
+        }
         if (!element.__betterGifsOnError) {
             element.__betterGifsOnError = () => {
                 if (!element.__betterGifsActive) return;
                 if (this.isDiscordAttachmentUrl(element.__betterGifsCurrentCandidate || "")) {
-                    this.removeMyGifOn404(element.__betterGifsEntryId);
+                    element.__betterGifsFailed = true;
                 }
                 element.__betterGifsIndex += 1;
-                this.tryPreviewCandidate(element);
+                if ((element.__betterGifsCandidates || []).length > element.__betterGifsIndex) {
+                    this.tryPreviewCandidate(element);
+                    return;
+                }
+                this.handlePreviewFailure(element);
             };
             element.addEventListener("error", element.__betterGifsOnError);
         }
 
         this.tryPreviewCandidate(element);
+    }
+
+    handlePreviewFailure(element) {
+        if (!element) return;
+        const entryId = element.__betterGifsEntryId;
+        if (entryId) {
+            this.previewRetryAfter.set(entryId, Date.now() + PREVIEW_RETRY_COOLDOWN_MS);
+            this.verifyMyGifAvailability(entryId, element.__betterGifsCandidates || []).then(result => {
+                if (result !== true) return;
+                if (!element.isConnected || !element.__betterGifsActive) return;
+                element.__betterGifsIndex = 0;
+                this.tryPreviewCandidate(element);
+            }).catch(error => this.logError("Preview availability verification failed", error));
+        }
+
+        if (element.tagName === "VIDEO") {
+            try {
+                element.pause();
+                element.removeAttribute("src");
+                element.load();
+            } catch {}
+            return;
+        }
+        element.removeAttribute("src");
     }
 
     deactivatePreview(element) {
@@ -1600,10 +2120,6 @@ module.exports = class InfiniteGifs {
         const candidate = candidates[index];
         element.__betterGifsCurrentCandidate = candidate;
         this.setMediaElementSource(element, candidate);
-        this.cachePreviewCandidate(element.__betterGifsEntryId, candidate).then(objectUrl => {
-            if (!element.isConnected || !element.__betterGifsActive) return;
-            if (objectUrl) this.setMediaElementSource(element, objectUrl);
-        }).catch(() => {});
     }
 
     setMediaElementSource(element, source) {
@@ -1618,36 +2134,82 @@ module.exports = class InfiniteGifs {
         }
     }
 
-    async cachePreviewCandidate(entryId, sourceUrl) {
-        const cacheKey = `${entryId}:${sourceUrl}`;
-        if (!this.isDiscordAttachmentUrl(sourceUrl) && this.previewObjectUrls.has(cacheKey)) {
-            const objectUrl = this.previewObjectUrls.get(cacheKey);
-            this.previewObjectUrls.delete(cacheKey);
-            this.previewObjectUrls.set(cacheKey, objectUrl);
-            return objectUrl;
-        }
-        if (this.previewLoads.has(cacheKey)) return this.previewLoads.get(cacheKey);
+    prioritizePreviewCandidates(entryId, candidates = []) {
+        const preferred = this.previewPreferredCandidates.get(entryId);
+        if (!preferred || !candidates.includes(preferred)) return candidates;
+        return [preferred, ...candidates.filter(candidate => candidate !== preferred)];
+    }
 
-        const load = fetch(sourceUrl, {
-            credentials: "omit",
-            cache: this.isDiscordAttachmentUrl(sourceUrl) ? "no-store" : "force-cache"
-        }).then(async response => {
-            if (response.status === 404) this.removeMyGifOn404(entryId);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            if (await this.responseContainsUnavailableText(response)) throw new Error("Unavailable content");
-            if (!this.isUsableMediaResponse(response, sourceUrl)) throw new Error("Not media");
-            return response.blob();
-        }).then(blob => {
-            const objectUrl = URL.createObjectURL(blob);
-            this.previewObjectUrls.set(cacheKey, objectUrl);
-            this.prunePreviewCache();
-            return objectUrl;
-        }).finally(() => {
-            this.previewLoads.delete(cacheKey);
+    enqueuePreviewLoad(task) {
+        return new Promise((resolve, reject) => {
+            this.previewQueue.push(async () => {
+                try {
+                    resolve(await task());
+                } catch (error) {
+                    reject(error);
+                } finally {
+                    this.previewActiveLoads = Math.max(0, this.previewActiveLoads - 1);
+                    this.drainPreviewQueue();
+                }
+            });
+            this.drainPreviewQueue();
         });
+    }
 
-        this.previewLoads.set(cacheKey, load);
-        return load;
+    drainPreviewQueue() {
+        while (this.previewActiveLoads < PREVIEW_CONCURRENCY && this.previewQueue.length) {
+            const next = this.previewQueue.shift();
+            this.previewActiveLoads += 1;
+            next?.();
+        }
+    }
+
+    warmPreviewCandidates(entries = []) {
+        return entries;
+    }
+
+    async cachePreviewCandidate(entryId, sourceUrl) {
+        void entryId;
+        void sourceUrl;
+        // Preview prefetching caused noisy CORS failures on Discord CDN/media URLs.
+        // Native img/video loading is enough here and keeps scrolling much smoother.
+        return null;
+    }
+
+    shouldCachePreviewUrl(sourceUrl) {
+        void sourceUrl;
+        return false;
+    }
+
+    getDiscordMediaVariants(url) {
+        try {
+            const parsed = new URL(url);
+            if (!this.isDiscordAttachmentUrl(parsed.toString())) return [];
+
+            const variants = [];
+            const pushVariant = value => {
+                const normalized = this.basicNormalizeUrl(value);
+                if (normalized) variants.push(normalized);
+            };
+
+            pushVariant(parsed.toString());
+
+            const mediaVariant = new URL(parsed.toString());
+            mediaVariant.hostname = "media.discordapp.net";
+            if (/\.(gif|webp)$/i.test(mediaVariant.pathname) && !mediaVariant.searchParams.has("animated")) {
+                mediaVariant.searchParams.set("animated", "true");
+            }
+            pushVariant(mediaVariant.toString());
+
+            const cdnVariant = new URL(parsed.toString());
+            cdnVariant.hostname = "cdn.discordapp.com";
+            if (cdnVariant.searchParams.get("animated") === "true") cdnVariant.searchParams.delete("animated");
+            pushVariant(cdnVariant.toString());
+
+            return [...new Set(variants)];
+        } catch {
+            return [];
+        }
     }
 
     getPreviewCandidates(entry) {
@@ -1656,7 +2218,12 @@ module.exports = class InfiniteGifs {
             ...(entry?.url ? [entry.url] : []),
             ...(entry?.sourceUrl ? this.extractEmbeddedUrls(entry.sourceUrl) : [])
         ];
-        return [...new Set(candidates.map(url => this.resolvePreferredMediaUrl(url)).filter(Boolean))];
+        return [...new Set(candidates.flatMap(url => {
+            const direct = this.unwrapDiscordExternalUrl(url);
+            const resolved = this.resolvePreferredMediaUrl(url);
+            const discordVariants = this.getDiscordMediaVariants(direct || resolved || url);
+            return [direct, resolved, ...discordVariants].filter(Boolean);
+        }))];
     }
 
     getAvailabilityCandidates(entry) {
@@ -1666,9 +2233,13 @@ module.exports = class InfiniteGifs {
         ].filter(Boolean);
 
         const canonicalDiscordUrl = canonicalCandidates.find(url => this.isDiscordAttachmentUrl(url));
-        if (canonicalDiscordUrl) return [canonicalDiscordUrl];
+        const previewCandidates = this.getPreviewCandidates(entry);
+        if (!canonicalDiscordUrl) return previewCandidates;
 
-        return this.getPreviewCandidates(entry);
+        return [
+            canonicalDiscordUrl,
+            ...previewCandidates.filter(url => url !== canonicalDiscordUrl)
+        ];
     }
 
     extractEmbeddedUrls(text) {
@@ -1702,6 +2273,8 @@ module.exports = class InfiniteGifs {
 
     resolvePreferredMediaUrl(input) {
         const candidates = this.extractEmbeddedUrls(input);
+        const unwrappedExternal = this.unwrapDiscordExternalUrl(input);
+        if (unwrappedExternal) candidates.push(unwrappedExternal);
         if (!candidates.length && typeof input === "string" && input.startsWith("https://")) {
             candidates.push(this.trimProtoUrlSegment(input));
         }
@@ -1738,8 +2311,14 @@ module.exports = class InfiniteGifs {
     basicNormalizeUrl(url) {
         try {
             const parsed = new URL(url);
-            for (const key of ["ex", "is", "hm", "width", "height", "format", "name"]) {
+            const isDiscordAttachment = this.isDiscordAttachmentUrl(parsed.toString());
+            for (const key of ["width", "height"]) {
                 parsed.searchParams.delete(key);
+            }
+            if (!isDiscordAttachment) {
+                for (const key of ["ex", "is", "hm", "format", "name"]) {
+                    parsed.searchParams.delete(key);
+                }
             }
             const sorted = [...parsed.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b));
             parsed.search = new URLSearchParams(sorted).toString();
@@ -1759,6 +2338,663 @@ module.exports = class InfiniteGifs {
         } catch {
             return false;
         }
+    }
+
+    isGifShareUrl(url) {
+        try {
+            const parsed = new URL(url);
+            const host = parsed.hostname.toLowerCase();
+            if (host === "tenor.com") return /\/view\//i.test(parsed.pathname);
+            if (host === "giphy.com") return /\/(?:gifs|embed)\//i.test(parsed.pathname);
+            return false;
+        } catch {
+            return false;
+        }
+    }
+
+    scoreSendCandidate(url) {
+        try {
+            const parsed = new URL(url);
+            const host = parsed.hostname.toLowerCase();
+            const pathAndQuery = `${parsed.pathname}${parsed.search}`.toLowerCase();
+            let score = 0;
+
+            if (this.isGifShareUrl(url)) score += 300;
+            if (MEDIA_EXT_RE.test(pathAndQuery)) score += 80;
+            if (/\.gif(?:$|[?#])/.test(pathAndQuery)) score += 120;
+            if (/^(cdn|media)\.discordapp\.(?:com|net)$/i.test(host)) score += 70;
+            if (/^(media\.tenor\.com|media\d*\.giphy\.com|i\.giphy\.com)$/i.test(host)) score -= 140;
+            if (/\.(mp4|webm)(?:$|[?#])/.test(pathAndQuery)) score -= 120;
+
+            return score;
+        } catch {
+            return -Infinity;
+        }
+    }
+
+    getSendMediaUrl(entryOrUrl) {
+        if (typeof entryOrUrl === "string") return entryOrUrl;
+
+        const rawCandidates = [
+            entryOrUrl?.sourceUrl,
+            entryOrUrl?.previewUrl,
+            entryOrUrl?.url
+        ].filter(Boolean);
+
+        const candidates = [...new Set(rawCandidates.flatMap(candidate => {
+            const urls = [
+                candidate,
+                this.unwrapDiscordExternalUrl(candidate),
+                ...this.extractEmbeddedUrls(candidate)
+            ].filter(Boolean);
+            return urls.map(url => this.basicNormalizeUrl(url) || url);
+        }))];
+
+        const ranked = candidates
+            .filter(Boolean)
+            .sort((a, b) => this.scoreSendCandidate(b) - this.scoreSendCandidate(a));
+
+        return ranked[0] || entryOrUrl?.url || entryOrUrl?.sourceUrl || "";
+    }
+
+    isTenorMediaUrl(url) {
+        try {
+            return new URL(url).hostname.toLowerCase() === "media.tenor.com";
+        } catch {
+            return false;
+        }
+    }
+
+    isGiphyMediaUrl(url) {
+        try {
+            return /^(media\d*\.giphy\.com|i\.giphy\.com)$/i.test(new URL(url).hostname);
+        } catch {
+            return false;
+        }
+    }
+
+    getGifProvider(entry, url = "") {
+        const candidates = [url, entry?.sourceUrl, entry?.url, entry?.previewUrl].filter(Boolean);
+        if (candidates.some(candidate => this.isTenorMediaUrl(candidate) || /(^|:\/\/)(?:www\.)?tenor\.com/i.test(candidate))) return "TENOR";
+        if (candidates.some(candidate => this.isGiphyMediaUrl(candidate) || /(^|:\/\/)(?:www\.)?giphy\.com/i.test(candidate))) return "GIPHY";
+        return "MEDIA";
+    }
+
+    translateVideoUrlToGifUrl(url) {
+        try {
+            const parsed = new URL(url);
+            if (!/\.(mp4|webm)$/i.test(parsed.pathname)) return "";
+            parsed.pathname = parsed.pathname.replace(/\.(mp4|webm)$/i, ".gif");
+            return this.basicNormalizeUrl(parsed.toString()) || parsed.toString();
+        } catch {
+            return "";
+        }
+    }
+
+    getTranslatedSendMediaUrl(entryOrUrl) {
+        if (typeof entryOrUrl === "string") {
+            return this.translateVideoUrlToGifUrl(entryOrUrl) || entryOrUrl;
+        }
+
+        const rawCandidates = [
+            this.getSendMediaUrl(entryOrUrl),
+            entryOrUrl?.sourceUrl,
+            entryOrUrl?.previewUrl,
+            entryOrUrl?.url
+        ].filter(Boolean);
+
+        const candidates = [...new Set(rawCandidates.flatMap(candidate => {
+            const translated = this.translateVideoUrlToGifUrl(candidate);
+            return [translated, candidate].filter(Boolean);
+        }))];
+
+        const ranked = candidates
+            .filter(Boolean)
+            .sort((a, b) => this.scoreSendCandidate(b) - this.scoreSendCandidate(a));
+
+        return ranked[0] || this.getSendMediaUrl(entryOrUrl);
+    }
+
+    async getEmbeddableSendMediaUrl(entry) {
+        const providerShareUrl = await this.getProviderShareUrl(entry);
+        return providerShareUrl || this.getSendMediaUrl(entry);
+    }
+
+    buildGifSlug(title) {
+        return String(title || "")
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-+|-+$/g, "");
+    }
+
+    makeMessageNonce() {
+        try {
+            if (typeof globalThis.crypto?.randomUUID === "function") {
+                return globalThis.crypto.randomUUID().replace(/-/g, "");
+            }
+        } catch {}
+
+        try {
+            if (typeof globalThis.crypto?.getRandomValues === "function") {
+                const bytes = new Uint8Array(16);
+                globalThis.crypto.getRandomValues(bytes);
+                return [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
+            }
+        } catch {}
+
+        const randomHex = () => Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0");
+        return `${randomHex()}${randomHex()}${randomHex()}${randomHex()}`;
+    }
+
+    getPrimaryMediaUrl(entry) {
+        const candidates = [
+            entry?.url,
+            entry?.previewUrl,
+            entry?.sourceUrl,
+            this.getSendMediaUrl(entry)
+        ].filter(Boolean);
+
+        for (const candidate of candidates) {
+            const direct = this.unwrapDiscordExternalUrl(candidate);
+            const resolved = this.resolvePreferredMediaUrl(direct || candidate);
+            const normalized = this.basicNormalizeUrl(resolved || direct || candidate);
+            if (!normalized || this.isGifShareUrl(normalized)) continue;
+            return normalized;
+        }
+
+        return this.getSendMediaUrl(entry);
+    }
+
+    async getProviderShareUrl(entry) {
+        const directCandidates = [entry?.sourceUrl, entry?.previewUrl, entry?.url]
+            .filter(candidate => this.isGifShareUrl(candidate));
+        if (directCandidates.length) return directCandidates[0];
+        return "";
+    }
+
+    buildNativeGifPayload(entry, { providerShareUrl = "" } = {}) {
+        const mediaUrl = this.getPrimaryMediaUrl(entry);
+        const previewUrl = this.resolvePreferredMediaUrl(entry?.previewUrl || entry?.sourceUrl || mediaUrl) || mediaUrl;
+        const sendUrl = providerShareUrl || mediaUrl;
+        const provider = this.getGifProvider(entry, sendUrl);
+        const title = entry?.title || this.inferTitleFromUrl(sendUrl || mediaUrl);
+        const slug = this.buildGifSlug(title);
+
+        return {
+            id: entry?.id || mediaUrl || sendUrl,
+            url: sendUrl,
+            src: mediaUrl,
+            gifSrc: previewUrl,
+            mp4: mediaUrl,
+            mediaUrl,
+            preview: previewUrl,
+            previewUrl,
+            providerUrl: providerShareUrl || "",
+            title,
+            slug,
+            provider,
+            type: "GIF",
+            format: this.isVideoCandidate(mediaUrl) ? "VIDEO" : "IMAGE",
+            width: 0,
+            height: 0
+        };
+    }
+
+    buildNativeGifMetadata(entry, { providerShareUrl = "" } = {}) {
+        const gifUrl = providerShareUrl || this.getPrimaryMediaUrl(entry) || this.getSendMediaUrl(entry);
+        if (!gifUrl) return null;
+
+        return {
+            gif_provider: "klipy",
+            load_id: this.makeMessageNonce(),
+            source_object: "GIF Picker",
+            gif_url: gifUrl,
+            gif_id: null
+        };
+    }
+
+    buildGifMessagePayload(channelOrId, content = "", tts = false) {
+        const webpack = BdApi?.Webpack;
+        const messageParser = webpack?.getModule?.(module => module?.parse && module?.unparse);
+        const channelId = typeof channelOrId === "string" ? channelOrId : channelOrId?.id || "";
+        const parseTarget = channelOrId || channelId;
+
+        let message = null;
+        try {
+            if (typeof messageParser?.parse === "function") {
+                message = messageParser.parse(parseTarget, content);
+            }
+        } catch {}
+
+        if (message && typeof message === "object") {
+            if (typeof message.content !== "string") message.content = content;
+            message.tts = !!(message.tts || tts);
+            if (!Array.isArray(message.invalidEmojis)) message.invalidEmojis = [];
+            if (!Array.isArray(message.validNonShortcutEmojis)) message.validNonShortcutEmojis = [];
+            return message;
+        }
+
+        return {
+            content,
+            tts: !!tts,
+            invalidEmojis: [],
+            validNonShortcutEmojis: []
+        };
+    }
+
+    getActiveChannelId() {
+        const webpack = BdApi?.Webpack;
+        const selectedChannelStore = webpack?.getByKeys?.("getChannelId", "getLastSelectedChannelId");
+        return selectedChannelStore?.getChannelId?.() ||
+            selectedChannelStore?.getCurrentlySelectedChannelId?.() ||
+            selectedChannelStore?.getLastSelectedChannelId?.() ||
+            "";
+    }
+
+    getActiveChannel() {
+        const webpack = BdApi?.Webpack;
+        const channelId = this.getActiveChannelId();
+        if (!webpack || !channelId) return null;
+
+        const channelStore =
+            webpack.getByKeys?.("getChannel", "getDMFromUserId") ||
+            webpack.getByKeys?.("getChannel", "getMutablePrivateChannels");
+        return channelStore?.getChannel?.(channelId) || null;
+    }
+
+    getChatInputLocation() {
+        const webpack = BdApi?.Webpack;
+        if (!webpack?.getModule) return null;
+
+        const locationModule = webpack.getModule(module =>
+            module?.Hx?.CHAT_INPUT ||
+            module?.default?.CHAT_INPUT ||
+            module?.ANALYTICS_LOCATIONS?.CHAT_INPUT
+        );
+
+        return locationModule?.Hx?.CHAT_INPUT ||
+            locationModule?.default?.CHAT_INPUT ||
+            locationModule?.ANALYTICS_LOCATIONS?.CHAT_INPUT ||
+            null;
+    }
+
+    getGifMessageActions() {
+        const webpack = BdApi?.Webpack;
+        if (!webpack) return null;
+
+        return webpack.getByKeys?.("sendMessage", "getSendMessageOptions") ||
+            webpack.getByKeys?.("_sendMessage", "getSendMessageOptions") ||
+            webpack.getModule?.(module =>
+                typeof module?.getSendMessageOptions === "function" &&
+                (typeof module?.sendMessage === "function" || typeof module?._sendMessage === "function")
+            ) ||
+            null;
+    }
+
+    getGifSendOptionsFromArgs(args = []) {
+        for (const value of args.slice(2)) {
+            if (!value || typeof value !== "object") continue;
+            if (value.isGif === true || value.gifMetadata) return value;
+        }
+        return null;
+    }
+
+    cloneNativeGifDebugValue(value, depth = 0) {
+        if (value == null || depth > 4) return value ?? null;
+        if (typeof value === "function") return `[Function ${value.name || "anonymous"}]`;
+        if (typeof value !== "object") return value;
+        if (Array.isArray(value)) return value.slice(0, 12).map(item => this.cloneNativeGifDebugValue(item, depth + 1));
+
+        const output = {};
+        for (const [key, entry] of Object.entries(value)) {
+            if (key === "channel") continue;
+            output[key] = this.cloneNativeGifDebugValue(entry, depth + 1);
+        }
+        return output;
+    }
+
+    recordObservedNativeGifSend(methodName, args = []) {
+        const options = this.getGifSendOptionsFromArgs(args);
+        if (!options) return;
+
+        const snapshot = {
+            source: this.nativeGifProbeDepth > 0 ? "plugin-probe" : "discord-native",
+            methodName,
+            channelId: args[0] || "",
+            payload: this.cloneNativeGifDebugValue(args[1]),
+            options: this.cloneNativeGifDebugValue(options)
+        };
+
+        this.lastObservedNativeGifSend = snapshot;
+        window[`${PLUGIN_ID}_lastObservedNativeGifSend`] = snapshot;
+        console.log("[InfiniteGifs] Observed native GIF send", snapshot);
+
+        const gifMetadataKeys = Object.keys(options.gifMetadata || {});
+        this.log(`Observed native GIF send via ${methodName} (${snapshot.source}) with gifMetadata keys: ${gifMetadataKeys.join(", ") || "none"}`);
+    }
+
+    wrapGifSendMethod(module, methodName) {
+        const original = module?.[methodName];
+        if (typeof original !== "function") return null;
+
+        const plugin = this;
+        const wrapped = function(...args) {
+            try {
+                plugin.recordObservedNativeGifSend(methodName, args);
+            } catch (error) {
+                plugin.logError(`Failed to record native GIF send via ${methodName}`, error);
+            }
+            return original.apply(this, args);
+        };
+        wrapped.__original = original;
+        module[methodName] = wrapped;
+        return original;
+    }
+
+    installGifSendInspector() {
+        const module = this.getGifMessageActions();
+        if (!module) return;
+        if (this.gifMessageActionsModule === module) return;
+
+        this.uninstallGifSendInspector();
+        this.gifMessageActionsModule = module;
+        this.originalGifSendMessage = this.wrapGifSendMethod(module, "sendMessage");
+        this.originalGifUnderscoreSendMessage = this.wrapGifSendMethod(module, "_sendMessage");
+    }
+
+    uninstallGifSendInspector() {
+        const module = this.gifMessageActionsModule;
+        if (module?.sendMessage && this.originalGifSendMessage) {
+            module.sendMessage = this.originalGifSendMessage;
+        }
+        if (module?._sendMessage && this.originalGifUnderscoreSendMessage) {
+            module._sendMessage = this.originalGifUnderscoreSendMessage;
+        }
+
+        this.gifMessageActionsModule = null;
+        this.originalGifSendMessage = null;
+        this.originalGifUnderscoreSendMessage = null;
+        delete window[`${PLUGIN_ID}_lastObservedNativeGifSend`];
+    }
+
+    getDispatcher() {
+        const webpack = BdApi?.Webpack;
+        if (!webpack) return null;
+
+        return webpack.getByKeys?.("dispatch", "subscribe", "unsubscribe", { searchExports: true }) ||
+            webpack.getByKeys?.("dispatch", "subscribe", "register", { searchExports: true }) ||
+            webpack.getByKeys?.("dispatch", "subscribe", { searchExports: true }) ||
+            webpack.getModule?.(module =>
+                typeof module?.dispatch === "function" &&
+                typeof module?.subscribe === "function" &&
+                (typeof module?.unsubscribe === "function" || typeof module?.register === "function")
+            , { searchExports: true }) ||
+            null;
+    }
+
+    getCurrentUserId() {
+        const webpack = BdApi?.Webpack;
+        if (!webpack) return "";
+
+        const userStore = webpack.getByKeys?.("getCurrentUser", "getUser");
+        return userStore?.getCurrentUser?.()?.id || "";
+    }
+
+    getActionMessage(action) {
+        return action?.message ||
+            action?.optimisticMessage ||
+            action?.messageRecord ||
+            action?.localMessage ||
+            action?.messageData ||
+            null;
+    }
+
+    getActionChannelId(action) {
+        const message = this.getActionMessage(action);
+        return action?.channelId ||
+            action?.channel?.id ||
+            message?.channel_id ||
+            message?.channelId ||
+            "";
+    }
+
+    getActionAuthorId(action) {
+        const message = this.getActionMessage(action);
+        return message?.author?.id ||
+            message?.authorId ||
+            message?.user_id ||
+            message?.userId ||
+            "";
+    }
+
+    isConfirmedOutgoingMessageAction(action, channelId, currentUserId) {
+        const actionType = String(action?.type || "");
+        if (!actionType) return false;
+
+        const matchesType =
+            actionType === "MESSAGE_CREATE" ||
+            actionType === "MESSAGE_UPDATE" ||
+            actionType === "LOCAL_MESSAGE_CREATE" ||
+            actionType === "SEND_MESSAGE_SUCCESS" ||
+            actionType === "MESSAGE_SEND_SUCCESS";
+        if (!matchesType) return false;
+
+        if (this.getActionChannelId(action) !== channelId) return false;
+
+        const authorId = this.getActionAuthorId(action);
+        if (currentUserId && authorId && authorId !== currentUserId) return false;
+
+        return true;
+    }
+
+    async invokeAndConfirmOutgoingMessage(channelId, invoke, label) {
+        const dispatcher = this.getDispatcher();
+        if (!dispatcher?.subscribe || !dispatcher?.unsubscribe) {
+            this.log(`${label} could not confirm dispatch: dispatcher unavailable`);
+            return false;
+        }
+
+        const currentUserId = this.getCurrentUserId();
+        const actionTypes = [
+            "MESSAGE_CREATE",
+            "MESSAGE_UPDATE",
+            "LOCAL_MESSAGE_CREATE",
+            "SEND_MESSAGE_SUCCESS",
+            "MESSAGE_SEND_SUCCESS"
+        ];
+        let confirmed = false;
+        const handler = action => {
+            if (this.isConfirmedOutgoingMessageAction(action, channelId, currentUserId)) {
+                confirmed = true;
+            }
+        };
+
+        for (const actionType of actionTypes) {
+            try {
+                dispatcher.subscribe(actionType, handler);
+            } catch {}
+        }
+
+        try {
+            const result = invoke();
+            if (result?.then) await result;
+
+            const deadline = Date.now() + 1500;
+            while (Date.now() < deadline) {
+                if (confirmed) return true;
+                await this.delay(50);
+            }
+
+            this.log(`${label} did not dispatch an outgoing message`);
+            return false;
+        } finally {
+            for (const actionType of actionTypes) {
+                try {
+                    dispatcher.unsubscribe(actionType, handler);
+                } catch {}
+            }
+        }
+    }
+
+    async tryNativeGifMessageSend(entry, { providerShareUrl = "" } = {}) {
+        const channelId = this.getActiveChannelId();
+        const channel = this.getActiveChannel();
+        if (!channelId || !channel || !entry) {
+            this.log("Native GIF message send unavailable: missing channel, channel object, or entry");
+            return false;
+        }
+
+        const messageActions = this.getGifMessageActions();
+        if (!messageActions) {
+            this.log("Native GIF message send unavailable: no GIF-aware message module found");
+            return false;
+        }
+
+        const gifContent = providerShareUrl || this.getPrimaryMediaUrl(entry) || this.getSendMediaUrl(entry);
+        if (!gifContent) {
+            this.log("Native GIF message send unavailable: no GIF URL resolved");
+            return false;
+        }
+
+        const gifMetadata = this.buildNativeGifMetadata(entry, { providerShareUrl });
+        if (!gifMetadata) {
+            this.log("Native GIF message send unavailable: could not build gifMetadata");
+            return false;
+        }
+
+        const payloads = [
+            this.buildGifMessagePayload(channel, gifContent)
+        ];
+
+        for (const payload of payloads) {
+            const label = payload?.content ? "content" : "empty";
+            let options = {};
+
+            try {
+                if (typeof messageActions.getSendMessageOptions === "function") {
+                    options = {
+                        ...messageActions.getSendMessageOptions({
+                            content: payload?.content || "",
+                            channelId: channel.id,
+                            uploads: undefined,
+                            stickers: undefined,
+                            command: undefined,
+                            isGif: true,
+                            pendingReply: undefined,
+                            alsoForwardToChannelId: undefined,
+                            scheduledTimestamp: undefined
+                        })
+                    };
+                } else {
+                    options = {
+                        isGif: true
+                    };
+                }
+            } catch (error) {
+                this.log(`Native GIF message options helper failed for ${label} payload: ${error?.message || "unknown error"}`);
+                options = {
+                    isGif: true
+                };
+            }
+
+            const location = this.getChatInputLocation();
+            if (location != null) options.location = location;
+            if (!Object.prototype.hasOwnProperty.call(options, "alsoForwardToChannelId")) options.alsoForwardToChannelId = null;
+            options.gifMetadata = gifMetadata;
+
+            const attempts = [
+                ["sendMessage", messageActions.sendMessage]
+            ].filter(([, method]) => typeof method === "function");
+            if (!attempts.length) {
+                this.log("Native GIF message send unavailable: no callable sendMessage method");
+                return false;
+            }
+
+            for (const [methodName, method] of attempts) {
+                const variants = [[
+                    "options as fourth arg",
+                    () => {
+                        this.nativeGifProbeDepth += 1;
+                        try {
+                            return method.call(messageActions, channel.id, payload, undefined, options);
+                        } finally {
+                            this.nativeGifProbeDepth = Math.max(0, this.nativeGifProbeDepth - 1);
+                        }
+                    }
+                ]];
+
+                for (const [variantLabel, attempt] of variants) {
+                    try {
+                        const confirmed = await this.invokeAndConfirmOutgoingMessage(
+                            channelId,
+                            attempt,
+                            `Native GIF message send via ${methodName} using ${label} payload (${variantLabel})`
+                        );
+                        if (!confirmed) continue;
+                        this.log(`Native GIF message send accepted via ${methodName} using ${label} payload (${variantLabel})`);
+                        return true;
+                    } catch (error) {
+                        this.log(`Native GIF message send rejected via ${methodName} using ${label} payload (${variantLabel}): ${error?.message || "unknown error"}`);
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    async tryNativeGifSend(entry, { providerShareUrl = "" } = {}) {
+        const webpack = BdApi?.Webpack;
+        const channelId = this.getActiveChannelId();
+        if (!webpack || !channelId || !entry) {
+            this.log("Legacy GIF helper send unavailable: missing webpack, channel, or entry");
+            return false;
+        }
+
+        const payload = this.buildNativeGifPayload(entry, { providerShareUrl });
+        const actionModules = [
+            webpack.getByKeys?.("sendGIF", "sendSticker"),
+            webpack.getByKeys?.("sendGif", "sendSticker"),
+            webpack.getByKeys?.("sendGIF"),
+            webpack.getByKeys?.("sendGif")
+        ].filter(Boolean);
+        if (!actionModules.length) {
+            this.log("Legacy GIF helper send unavailable: no GIF helper modules found");
+            return false;
+        }
+
+        const methodNames = ["sendGIF", "sendGif"];
+        for (const module of actionModules) {
+            for (const methodName of methodNames) {
+                const method = module?.[methodName];
+                if (typeof method !== "function") continue;
+
+                const attempts = [
+                    () => method.call(module, channelId, payload),
+                    () => method.call(module, payload, channelId),
+                    () => method.call(module, { channelId, gif: payload }),
+                    () => method.call(module, { channelId, result: payload }),
+                    () => method.call(module, payload)
+                ];
+
+                for (const attempt of attempts) {
+                    try {
+                        const confirmed = await this.invokeAndConfirmOutgoingMessage(
+                            channelId,
+                            attempt,
+                            `Legacy GIF helper ${methodName}`
+                        );
+                        if (!confirmed) continue;
+                        this.log(`Legacy GIF helper send accepted via ${methodName}`);
+                        return true;
+                    } catch (error) {
+                        this.log(`Legacy GIF helper ${methodName} rejected: ${error?.message || "unknown error"}`);
+                    }
+                }
+            }
+        }
+
+        return false;
     }
 
     isDiscordAttachmentUrl(url) {
@@ -1801,7 +3037,11 @@ module.exports = class InfiniteGifs {
 
         const meta = document.createElement("div");
         meta.className = "bettergifs-library-meta";
-        meta.textContent = entry.folder ? `Folder: ${entry.folder}` : "No folder";
+        const libraryHealth = this.getMyGifHealth(entry.id);
+        meta.textContent = libraryHealth?.status === "unavailable"
+            ? `Unavailable${libraryHealth.reason ? ` (${libraryHealth.reason})` : ""}`
+            : (entry.folder ? `Folder: ${entry.folder}` : "No folder");
+        if (libraryHealth?.status === "unavailable") meta.classList.add("bettergifs-badge-warn");
 
         const tagRow = document.createElement("div");
         tagRow.className = "bettergifs-tag-row";
@@ -1817,6 +3057,7 @@ module.exports = class InfiniteGifs {
         const actionRow = document.createElement("div");
         actionRow.className = "bettergifs-row";
         actionRow.append(
+            this.createButton("Send", "success", () => actions.onSend?.(entry)),
             this.createButton("Copy URL", "ghost", () => actions.onCopy?.(entry)),
             this.createButton("Open", "ghost", () => actions.onOpen?.(entry)),
             this.createButton("Remove", "danger", () => actions.onRemove?.(entry))
@@ -1834,13 +3075,11 @@ module.exports = class InfiniteGifs {
 
         const modal = document.createElement("div");
         modal.id = MODAL_ID;
-        modal.addEventListener("click", event => {
-            if (event.target === modal) this.closeModal();
-        });
 
         modal.appendChild(this.buildPickerPanel());
         document.body.appendChild(modal);
         this.modal = modal;
+        document.addEventListener("keydown", this.handleModalKeydown);
         this.scheduleFavoriteScan();
     }
 
@@ -1848,6 +3087,7 @@ module.exports = class InfiniteGifs {
         this.modal?.firstElementChild?.__betterGifsCleanup?.();
         this.modal?.remove();
         this.modal = null;
+        document.removeEventListener("keydown", this.handleModalKeydown);
     }
 
     normalizeMyGifEntry(entry) {
@@ -1909,6 +3149,8 @@ module.exports = class InfiniteGifs {
                 createdAt: this.myGifs[existingIndex].createdAt
             };
         }
+        this.availabilityPreloadKeys.clear();
+        this.markMyGifAvailable(created ? normalized.id : this.myGifs[existingIndex].id);
         this.saveMyGifs();
         return { created, entry: created ? normalized : this.myGifs[existingIndex] };
     }
@@ -1916,38 +3158,67 @@ module.exports = class InfiniteGifs {
     removeMyGif(id) {
         const before = this.myGifs.length;
         this.myGifs = this.myGifs.filter(entry => entry.id !== id);
-        if (this.myGifs.length !== before) this.saveMyGifs();
+        if (this.myGifs.length !== before) {
+            delete this.myGifHealth[id];
+            this.previewRetryAfter.delete(id);
+            this.availabilityChecks.delete(id);
+            this.previewPreferredCandidates.delete(id);
+            this.availabilityPreloadKeys.clear();
+            this.saveMyGifHealth();
+            this.saveMyGifs();
+        }
         return before - this.myGifs.length;
     }
 
-    removeMyGifOn404(id) {
-        if (!id || this.deadMyGifIds.has(id)) return 0;
-        this.deadMyGifIds.add(id);
-        for (const [cacheKey, objectUrl] of this.previewObjectUrls.entries()) {
-            if (!cacheKey.startsWith(`${id}:`)) continue;
-            this.previewObjectUrls.delete(cacheKey);
-            try {
-                URL.revokeObjectURL(objectUrl);
-            } catch {}
-        }
-        const removed = this.removeMyGif(id);
-        if (removed) this.refreshPanels("Removed unavailable GIF from My GIFs");
-        return removed;
+    removeMyGifOn404(id, reason = "404") {
+        if (!id) return 0;
+        this.previewRetryAfter.set(id, Date.now() + Math.max(PREVIEW_RETRY_COOLDOWN_MS, 5 * 60 * 1000));
+        this.markMyGifUnavailable(id, reason);
+        this.refreshPanels(`Marked GIF unavailable${reason ? ` (${reason})` : ""}`);
+        return 1;
     }
 
     getMyGifFolders() {
         return [...new Set(this.myGifs.map(entry => entry.folder).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     }
 
-    getFilteredMyGifs({ query = "", folder = "", tagQuery = "" } = {}) {
-        const normalizedQuery = query.trim().toLowerCase();
-        const normalizedTagQuery = tagQuery.trim().toLowerCase();
+    normalizeSearchText(value) {
+        return String(value || "")
+            .toLowerCase()
+            .normalize("NFKD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/[^a-z0-9]+/g, " ")
+            .trim();
+    }
+
+    matchesSearchToken(haystack, token) {
+        if (!token) return true;
+        if (haystack.includes(token)) return true;
+
+        let tokenIndex = 0;
+        for (const char of haystack) {
+            if (char === token[tokenIndex]) tokenIndex += 1;
+            if (tokenIndex >= token.length) return true;
+        }
+        return false;
+    }
+
+    isMyGifUnavailable(id) {
+        return this.getMyGifHealth(id)?.status === "unavailable";
+    }
+
+    getFilteredMyGifs({ query = "", folder = "", tagQuery = "", hideUnavailable = this.settings.hideUnavailable } = {}) {
+        const normalizedQuery = this.normalizeSearchText(query);
+        const normalizedTagQuery = this.normalizeSearchText(tagQuery);
+        const queryTokens = normalizedQuery ? normalizedQuery.split(/\s+/).filter(Boolean) : [];
         return this.myGifs.filter(entry => {
             if (folder && entry.folder !== folder) return false;
-            if (normalizedTagQuery && !entry.tags.some(tag => tag.includes(normalizedTagQuery))) return false;
-            if (!normalizedQuery) return true;
-            const haystack = [entry.title, entry.folder, entry.url, ...entry.tags].join(" ").toLowerCase();
-            return haystack.includes(normalizedQuery);
+            if (hideUnavailable && this.isMyGifUnavailable(entry.id)) return false;
+            if (normalizedTagQuery && !entry.tags.some(tag => this.normalizeSearchText(tag).includes(normalizedTagQuery))) return false;
+            if (!queryTokens.length) return true;
+
+            const haystack = this.normalizeSearchText([entry.title, entry.folder, entry.url, ...entry.tags].join(" "));
+            return queryTokens.every(token => this.matchesSearchToken(haystack, token));
         });
     }
 
@@ -1985,20 +3256,162 @@ module.exports = class InfiniteGifs {
         return { added, skipped };
     }
 
-    async checkMediaAvailability(url, entryId = "") {
+    async fetchMediaResponse(url, options = {}) {
+        if (BdApi?.Net?.fetch) return BdApi.Net.fetch(url, options);
+        return fetch(url, options);
+    }
+
+    async probeMediaAvailability(url) {
+        const isDiscordAttachment = this.isDiscordAttachmentUrl(url);
+
         try {
-            const response = await fetch(url, {
+            const response = await this.fetchMediaResponse(url, {
                 credentials: "omit",
                 cache: "no-store"
             });
-            if (response.status === 404) this.removeMyGifOn404(entryId);
-            if (!response.ok) return false;
-            if (await this.responseContainsUnavailableText(response)) return false;
+            if (!response) {
+                return {
+                    ok: isDiscordAttachment ? null : false,
+                    reason: "request failed",
+                    status: 0
+                };
+            }
+            if (response.status === 404) {
+                return {
+                    ok: false,
+                    reason: "404",
+                    status: 404
+                };
+            }
+            if (!response.ok) {
+                return {
+                    ok: false,
+                    reason: `HTTP ${response.status}`,
+                    status: response.status
+                };
+            }
+            if (await this.responseContainsUnavailableText(response)) {
+                return {
+                    ok: false,
+                    reason: "content unavailable",
+                    status: response.status
+                };
+            }
+            if (!this.isUsableMediaResponse(response, url)) {
+                return {
+                    ok: false,
+                    reason: "not media",
+                    status: response.status
+                };
+            }
 
-            return this.isUsableMediaResponse(response, url);
+            return {
+                ok: true,
+                reason: "",
+                status: response.status
+            };
         } catch {
-            return false;
+            return {
+                ok: isDiscordAttachment ? null : false,
+                reason: "request failed",
+                status: 0
+            };
         }
+    }
+
+    async verifyMyGifAvailability(entryId, candidates = []) {
+        if (!entryId) return null;
+        if (this.availabilityChecks.has(entryId)) return this.availabilityChecks.get(entryId);
+
+        const entry = this.myGifs.find(item => item.id === entryId);
+        if (!entry) return null;
+
+        const urls = [...new Set((candidates.length ? candidates : this.getAvailabilityCandidates(entry))
+            .flatMap(url => [url, ...this.getDiscordMediaVariants(url)])
+            .filter(Boolean))];
+
+        const verification = (async () => {
+            let sawUnknown = false;
+            let failureReason = "";
+
+            for (const url of urls) {
+                const result = await this.probeMediaAvailability(url);
+                if (result.ok === true) {
+                    this.markMyGifAvailable(entryId);
+                    this.previewPreferredCandidates.set(entryId, this.basicNormalizeUrl(url) || url);
+                    return true;
+                }
+                if (result.ok === null) {
+                    sawUnknown = true;
+                    continue;
+                }
+                if (!failureReason) failureReason = result.reason || "";
+            }
+
+            if (!sawUnknown) {
+                this.removeMyGifOn404(entryId, failureReason || "404");
+                return false;
+            }
+            return null;
+        })().finally(() => {
+            this.availabilityChecks.delete(entryId);
+        });
+
+        this.availabilityChecks.set(entryId, verification);
+        return verification;
+    }
+
+    makeAvailabilityPreloadKey({ query = "", folder = "", tagQuery = "", hideUnavailable = this.settings.hideUnavailable } = {}) {
+        return JSON.stringify({
+            query: this.normalizeSearchText(query),
+            folder: String(folder || "").trim(),
+            tagQuery: this.normalizeSearchText(tagQuery),
+            hideUnavailable: !!hideUnavailable,
+            size: this.myGifs.length
+        });
+    }
+
+    async preloadMyGifAvailability(entries = [], options = {}) {
+        const preloadKey = this.makeAvailabilityPreloadKey(options);
+        if (!options.force && this.availabilityPreloadKeys.has(preloadKey)) return;
+
+        const pendingEntries = entries.filter(entry => {
+            if (!entry?.id) return false;
+            const health = this.getMyGifHealth(entry.id);
+            return health?.status !== "available" && health?.status !== "unavailable";
+        });
+
+        if (!pendingEntries.length) {
+            this.availabilityPreloadKeys.add(preloadKey);
+            return;
+        }
+
+        const queue = [...pendingEntries];
+        const workers = Array.from({
+            length: Math.min(AVAILABILITY_PRELOAD_CONCURRENCY, queue.length)
+        }, async () => {
+            while (queue.length) {
+                const next = queue.shift();
+                if (!next?.id) continue;
+                try {
+                    await this.verifyMyGifAvailability(next.id);
+                } catch (error) {
+                    this.logError("Failed to preload GIF availability", error);
+                }
+            }
+        });
+
+        await Promise.all(workers);
+        this.availabilityPreloadKeys.add(preloadKey);
+    }
+
+    async checkMediaAvailability(url, entryId = "") {
+        const result = await this.probeMediaAvailability(url);
+        if (result.ok === true) {
+            this.markMyGifAvailable(entryId);
+            return true;
+        }
+        return result.ok === null ? this.isDiscordAttachmentUrl(url) : false;
     }
 
     async responseContainsUnavailableText(response) {
@@ -2016,7 +3429,7 @@ module.exports = class InfiniteGifs {
     isUsableMediaResponse(response, url = "") {
         const contentType = (response.headers.get("content-type") || "").toLowerCase();
         const contentLength = Number(response.headers.get("content-length") || 0);
-        if (contentLength === 0) return false;
+        if (contentLength === 0 && !this.isDiscordAttachmentUrl(url)) return false;
         if (contentType) return /^image\/|^video\//.test(contentType);
         return MEDIA_EXT_RE.test(url);
     }
@@ -2082,6 +3495,140 @@ module.exports = class InfiniteGifs {
         } catch (error) {
             this.logError("Failed to copy text", error);
             this.notice("Could not copy URL", "error");
+            return false;
+        }
+    }
+
+    async sendGifEntry(entry) {
+        const providerShareUrl = await this.getProviderShareUrl(entry);
+        if (providerShareUrl) {
+            return this.sendMediaUrl(providerShareUrl);
+        }
+
+        const plainUrl = this.getSendMediaUrl(entry);
+        const nativeCandidate = entry && this.isVideoCandidate(this.getPrimaryMediaUrl(entry) || plainUrl);
+        if (nativeCandidate) {
+            try {
+                const messageSent = await this.tryNativeGifMessageSend(entry, { providerShareUrl });
+                if (messageSent) return true;
+                this.log("Native GIF message send did not stick; falling back to legacy GIF helpers");
+            } catch (error) {
+                this.logError("Native GIF message send failed", error);
+            }
+
+            try {
+                const nativeSent = await this.tryNativeGifSend(entry, { providerShareUrl });
+                if (nativeSent) return true;
+                this.log("Legacy GIF helpers did not accept the payload; falling back to plain URL send");
+            } catch (error) {
+                this.logError("Legacy GIF helper send failed", error);
+            }
+        }
+
+        return this.sendMediaUrl(plainUrl);
+    }
+
+    async sendMediaUrl(url) {
+        try {
+            const webpack = BdApi?.Webpack;
+            const channelId = this.getActiveChannelId();
+            const messageActions = webpack?.getByKeys?.("sendMessage", "_sendMessage", "jumpToMessage");
+            const messageParser = webpack?.getModule?.(module => module?.parse && module?.unparse);
+
+            if (channelId && messageActions) {
+                let message = null;
+                try {
+                    if (typeof messageParser?.parse === "function") {
+                        message = messageParser.parse(channelId, url);
+                    }
+                } catch {}
+
+                const payload = message && typeof message === "object"
+                    ? {
+                        ...message,
+                        content: typeof message.content === "string" && message.content.length ? message.content : url,
+                        tts: !!message.tts
+                    }
+                    : {
+                        content: url,
+                        tts: false,
+                        invalidEmojis: [],
+                        validNonShortcutEmojis: []
+                    };
+
+                const sendMethods = [
+                    ["sendMessage", messageActions.sendMessage],
+                    ["_sendMessage", messageActions._sendMessage]
+                ].filter(([, method]) => typeof method === "function");
+
+                const variants = [
+                    [],
+                    [undefined, {}]
+                ];
+
+                for (const [methodName, method] of sendMethods) {
+                    for (const variantArgs of variants) {
+                        try {
+                            const result = method.call(messageActions, channelId, payload, ...variantArgs);
+                            if (result?.then) await result;
+                            return true;
+                        } catch {}
+                    }
+                }
+            }
+
+            const editor =
+                document.querySelector('div[role="textbox"][data-slate-editor="true"]') ||
+                document.querySelector('div[role="textbox"][contenteditable="true"]');
+            if (!editor) {
+                this.notice("Could not find the message box", "warning");
+                return false;
+            }
+
+            editor.focus();
+
+            const selection = window.getSelection?.();
+            if (selection && document.createRange) {
+                const range = document.createRange();
+                range.selectNodeContents(editor);
+                range.collapse(false);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+
+            const prefix = editor.textContent?.trim() ? " " : "";
+            const textToInsert = `${prefix}${url}`;
+            let inserted = false;
+
+            try {
+                inserted = document.execCommand("insertText", false, textToInsert);
+            } catch {}
+
+            if (!inserted) {
+                editor.textContent = `${editor.textContent || ""}${textToInsert}`;
+                editor.dispatchEvent(new InputEvent("input", {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: "insertText",
+                    data: textToInsert
+                }));
+            }
+
+            const enterEvent = {
+                key: "Enter",
+                code: "Enter",
+                keyCode: 13,
+                which: 13,
+                bubbles: true,
+                cancelable: true
+            };
+            editor.dispatchEvent(new KeyboardEvent("keydown", enterEvent));
+            editor.dispatchEvent(new KeyboardEvent("keypress", enterEvent));
+            editor.dispatchEvent(new KeyboardEvent("keyup", enterEvent));
+            return true;
+        } catch (error) {
+            this.logError("Failed to send GIF URL", error);
+            this.notice("Could not send GIF URL", "error");
             return false;
         }
     }
